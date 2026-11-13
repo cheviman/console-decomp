@@ -1,0 +1,4 @@
+__pycache__/
+build/
+# manuals, scans and other people's code downloaded for reference: never in the repository
+external/
