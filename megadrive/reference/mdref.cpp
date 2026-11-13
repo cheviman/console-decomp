@@ -152,7 +152,9 @@ void data_read(int z80, uint32_t address)
 
 u16 bus_read(offs_t address, u16 mem_mask)
 {
-	if (g_record_rom_reads && !g_reading_instructions)
+	// (not the vector an interrupt takes: the 68000 reads it between the instruction it interrupted and the
+	// handler's first, and no instruction asked for it)
+	if (g_record_rom_reads && !g_reading_instructions && !g_acknowledged)
 	{
 		if (mem_mask & 0xFF00)
 			record_read(g_rom_reads, g_cpu->pc(), address & 0xFFFFFE);
