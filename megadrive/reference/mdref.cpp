@@ -40,7 +40,9 @@
  *
  *    --sound-hashes, --sound-wav and --sound-trace run the sound side (sound/mdsound.cpp: MAME's Z80 and PSG,
  *    ymfm's YM2612): per frame the hash of the chips' samples and of the Z80's RAM; the mix as a WAV; the Z80
- *    addresses executed. Without them the Z80 stands still (and a program that waits on it may hang).
+ *    addresses executed. --z80-rom-reads and the load (--step) run it too: the Z80's accesses to the 68000's
+ *    bus take time from the 68000. Without any of them the Z80 stands still (and a program that waits on it
+ *    may hang).
  *
  *    The load: --step names the address where the program's main loop begins a step (a frame's work) and
  *    --idle the one where it starts waiting for the next frame. A step that is still working when VBLANK
@@ -604,7 +606,8 @@ int main(int argc, char **argv)
 	if (!sound_hashes_path.empty())
 		sound_hashes.open(sound_hashes_path);
 	std::vector<int16_t> sound_mix;
-	g_sound = sound_hashes.is_open() || !sound_wav_path.empty() || !sound_trace_path.empty() || !z80_rom_reads_path.empty();
+	g_sound = sound_hashes.is_open() || !sound_wav_path.empty() || !sound_trace_path.empty() || !z80_rom_reads_path.empty()
+		|| g_step_address != 0xFFFFFFFF;
 	g_record_rom_reads = !rom_reads_path.empty() || !z80_rom_reads_path.empty();
 	if (g_sound)
 		ms_attach(0);
