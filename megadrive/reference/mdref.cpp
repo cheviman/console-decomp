@@ -5,12 +5,12 @@
  *                 frame, and measure how much of each frame the program takes
  *    Version:     0.1.0
  *    Created:     13-11-2026
- *    Modified:    13-11-2026
+ *    Modified:    20-11-2026
  *    Author:      Sebastian Toyos
  *
  *    license:BSD-3-Clause
  *    Not part of the game. Usage:
- *      mdref [--frames N] [--script controls.txt] [--rom FOLDER] [--hashes FILE] [--trace FILE] [--calls FILE]
+ *      mdref [--timing cycles|frames] [--frames N] [--script controls.txt] [--rom FOLDER] [--hashes FILE] [--trace FILE] [--calls FILE]
  *            [--jumps FILE] [--rom-reads FILE] [--z80-rom-reads FILE] [--dump FRAME ... --dump-dir DIR]
  *            [--video-hashes FILE]
  *            [--video-dump FRAME ... --video-dir DIR] [--sound-hashes FILE] [--sound-wav FILE]
@@ -20,11 +20,19 @@
  *    It runs the original program, so it reads the player's cartridge when it starts, as MAME does (the
  *    game's game/extract.h: rom/ by default, a ROM file, a .zip or a folder).
  *
- *    Time is the board's, in master clocks (md/machine.h): the 68000 runs a line at a time at most, and each
- *    line begins when its time comes (md_line_start: the H interrupt's counter, the V interrupt at line 224,
+ *    --timing cycles, the default, keeps the console's pace. Time is the board's, in master clocks
+ *    (md/machine.h): the 68000 runs a line at a time at most, and each line begins when its time comes (md_line_start: the H interrupt's counter, the V interrupt at line 224,
  *    the Z80's INT). A frame ends when VBLANK begins, at line 224: its state hash is taken there, and the
  *    control script applied. The 68000 loses the time the board says (md/machine.h: the DMA, the FIFO, the
  *    refresh) by giving up cycles of its slice.
+ *
+ *    --timing frames runs the program the way the translated and the decompiled game run it (md/frames.h):
+ *    instructions take no time, and the board moves on to its next frame only where the program waits for it
+ *    with nothing to do (the game's frame waits: it takes the branch back of a loop that waits for an
+ *    interrupt, md_game_frame_idle): the lines up to
+ *    the next line 224 begin there, the frame ends, and the program takes the V interrupt after the loop's
+ *    first instruction. The 68000 never waits
+ *    and the Z80 stands still: not with the sound options, the load or the profile.
  *
  *    --hashes writes "FRAME HASH" per frame (md_state_hash); --trace and --calls the addresses executed and
  *    the ones reached by jsr or bsr; --jumps where each jmp or jsr through a register went ("FROM TO");
@@ -58,6 +66,7 @@
 
 #include "game/data.h"
 #include "game/extract.h"
+#include "md/frames.h"
 #include "md/machine.h"
 #include "md/script.h"
 #include "mdsound.h"
@@ -66,6 +75,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <set>
@@ -80,6 +90,8 @@ class reference_cpu : public m68000_device
 public:
 	reference_cpu() : m68000_device(m_config, "maincpu", nullptr, MD_CPU_CLOCK) {}
 	u32 pc() const { return m_ipc; }
+	// the data registers D0-D7
+	u32 d(int index) const { return m_da[index]; }
 	// the 68000 loses 'cycles' within its slice (the board holds its bus)
 	void lose(int cycles) { m_icount -= cycles; }
 
@@ -336,6 +348,43 @@ void profile(uint32_t pc)
 		g_stack.erase(g_stack.begin());    // (a stack the program left without returning)
 }
 
+// --timing frames: the board's next frame where the program has nothing to do (md/frames.h); a program that
+// stops getting there has stopped making frames
+bool g_frame_timing = false;
+std::function<void(unsigned)> g_frame_line;     // after each line begins
+std::function<void()> g_frame_vblank;           // when VBLANK begins: the frame ends
+uint64_t g_instructions_at_frame = 0;
+constexpr uint64_t kInstructionsPerFrameLimit = 200000000;
+
+// The frames asked for are done (frame timing)
+struct frames_done {};
+
+void frame_line(unsigned line)
+{
+	g_frame_line(line);
+}
+
+void frame_vblank()
+{
+	g_frame_vblank();
+}
+
+// The program took one of the game's frame waits, the branch back of a loop that waits for an interrupt (the
+// instruction before went back): if it has nothing to do, the board moves on to its next frame. The V interrupt
+// raised there is taken after this instruction, the loop's first
+void frame_wait(offs_t pc)
+{
+	if (g_previous_pc != 0xFFFFFFFF && md_frame_wait_at(g_previous_pc)
+		&& (pc & 0xFFFFFF) < (g_previous_pc & 0xFFFFFF) && md_game_frame_idle(g_previous_pc & 0xFFFFFF))
+	{
+		g_instructions_at_frame = g_instructions;
+		md_frames_next(frame_line, frame_vblank);
+		return;
+	}
+	if (g_instructions - g_instructions_at_frame > kInstructionsPerFrameLimit)
+		throw std::runtime_error("the program no longer reaches its frame waits");
+}
+
 void on_instruction(offs_t pc)
 {
 	g_instructions++;
@@ -345,6 +394,8 @@ void on_instruction(offs_t pc)
 	if (g_previous_pc != 0xFFFFFFFF && is_computed_jump(g_previous_pc))
 		g_jumps.emplace(g_previous_pc, pc & 0xFFFFFF);
 	profile(pc);
+	if (g_frame_timing)
+		frame_wait(pc);
 	if (pc == g_step_address)
 	{
 		if (!g_steps.empty() && g_steps.back().frames == 0)
@@ -482,7 +533,7 @@ uint32_t parse_address(const char *text)
 int main(int argc, char **argv)
 {
 	const char *usage =
-		"usage: mdref [--frames N] [--script FILE] [--rom FOLDER] [--hashes FILE] [--trace FILE] [--calls FILE]"
+		"usage: mdref [--timing cycles|frames] [--frames N] [--script FILE] [--rom FOLDER] [--hashes FILE] [--trace FILE] [--calls FILE]"
 		" [--jumps FILE] [--rom-reads FILE] [--z80-rom-reads FILE] [--dump FRAME ... --dump-dir DIR] [--video-hashes FILE] [--video-dump FRAME ... --video-dir DIR]"
 		" [--sound-hashes FILE] [--sound-wav FILE] [--sound-trace FILE] [--step ADDRESS --idle ADDRESS [--steps FILE]]"
 		" [--profile FILE [--profile-from FRAME]] [--no-refresh]\n";
@@ -498,7 +549,17 @@ int main(int argc, char **argv)
 	{
 		const std::string argument = argv[index];
 		const bool has_value = index + 1 < argc;
-		if (argument == "--frames" && has_value)
+		if (argument == "--timing" && has_value)
+		{
+			const std::string timing = argv[++index];
+			if (timing != "frames" && timing != "cycles")
+			{
+				std::cerr << usage;
+				return 1;
+			}
+			g_frame_timing = timing == "frames";
+		}
+		else if (argument == "--frames" && has_value)
 		{
 			frames = std::strtoull(argv[++index], nullptr, 10);
 			frames_given = true;
@@ -562,12 +623,13 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	md_insert(game_program, GAME_PROGRAM_SIZE);
-	md_board.hooks.now = now;
-	md_board.hooks.stall = stall;
+	md_board.hooks.now = g_frame_timing ? md_frames_now : now;
+	md_board.hooks.stall = g_frame_timing ? nullptr : stall;
 	md_board.hooks.sound_sync = sound_sync;
 	md_board.hooks.data_read = data_read;
 	md_power_on();
-	md_board.refresh = refresh ? 1 : 0;
+	md_board.refresh = refresh && !g_frame_timing ? 1 : 0;
+	md_frames_reset();
 
 	md_script *script = nullptr;
 	if (!script_path.empty())
@@ -611,71 +673,110 @@ int main(int argc, char **argv)
 	g_sound = sound_hashes.is_open() || !sound_wav_path.empty() || !sound_trace_path.empty() || !z80_rom_reads_path.empty()
 		|| g_step_address != 0xFFFFFFFF;
 	g_record_rom_reads = !rom_reads_path.empty() || !z80_rom_reads_path.empty();
+	if (g_frame_timing && (g_sound || !profile_path.empty()))
+	{
+		std::cerr << "--timing frames runs no sound, no load and no profile: the Z80 stands still and instructions "
+			"take no time\n";
+		return 1;
+	}
 	if (g_sound)
 		ms_attach(0);
+
+	// VBLANK: the frame ends
+	auto end_frame = [&](uint64_t frame, uint64_t time) {
+		if (g_working)
+			g_overruns++;
+		md_script_apply(script, frame);
+		if (g_sound)
+		{
+			ms_end_frame(time);
+			if (sound_hashes.is_open())
+			{
+				char text[64];
+				std::snprintf(text, sizeof(text), "%" PRIu64 " %016" PRIx64 " %016" PRIx64 "\n", frame,
+					ms_frame_samples_hash(), ms_state_hash());
+				sound_hashes << text;
+			}
+			if (!sound_wav_path.empty())
+			{
+				size_t count = 0;
+				const int16_t *mix = ms_frame_mix(&count);
+				sound_mix.insert(sound_mix.end(), mix, mix + count);
+			}
+		}
+		if (hashes.is_open())
+		{
+			char text[48];
+			std::snprintf(text, sizeof(text), "%" PRIu64 " %016" PRIx64 "\n", frame, md_state_hash());
+			hashes << text;
+		}
+		if (dump_frames.count(frame))
+			dump_frame(dump_folder, frame);
+		if (video_hashes.is_open())
+		{
+			char text[48];
+			std::snprintf(text, sizeof(text), "%" PRIu64 " %016" PRIx64 "\n", frame, picture_hash());
+			video_hashes << text;
+		}
+		if (video_dump_frames.count(frame))
+			write_bmp(video_folder + "/frame_" + std::to_string(frame) + ".bmp");
+	};
 
 	int status = 0;
 	uint64_t frame = 0;
 	try
 	{
-		for (frame = 1; frame <= frames; frame++)
+		if (g_frame_timing)
 		{
-			const uint64_t base = (frame - 1) * MD_FRAME_CLOCKS;
-			g_frame = frame;
-			g_profiling = !profile_path.empty() && frame > profile_from;
-			for (unsigned line = 0; line < MD_LINES; line++)
-			{
-				const uint64_t time = base + uint64_t(line) * MD_LINE_CLOCKS;
-				run_until(cpu, time);
-				if (g_sound)
-					ms_run_until(time);
-				md_line_start(line);
+			// the board's next frame where the program has nothing to do, as the translated program has it
+			g_frame_line = [&](unsigned line) {
 				sync_irq();
 				if (video && line < MD_VDP_HEIGHT)
 					md_vdp_render_line(&md_board.vdp, line, &g_picture[size_t(line) * MD_VDP_WIDTH]);
-				if (line != MD_ACTIVE_LINES)
-					continue;
-
-				// VBLANK: the frame ends
-				if (g_working)
-					g_overruns++;
-				md_script_apply(script, frame);
-				if (g_sound)
-				{
-					ms_end_frame(time);
-					if (sound_hashes.is_open())
-					{
-						char text[64];
-						std::snprintf(text, sizeof(text), "%" PRIu64 " %016" PRIx64 " %016" PRIx64 "\n", frame,
-							ms_frame_samples_hash(), ms_state_hash());
-						sound_hashes << text;
-					}
-					if (!sound_wav_path.empty())
-					{
-						size_t count = 0;
-						const int16_t *mix = ms_frame_mix(&count);
-						sound_mix.insert(sound_mix.end(), mix, mix + count);
-					}
-				}
-				if (hashes.is_open())
-				{
-					char text[48];
-					std::snprintf(text, sizeof(text), "%" PRIu64 " %016" PRIx64 "\n", frame, md_state_hash());
-					hashes << text;
-				}
-				if (dump_frames.count(frame))
-					dump_frame(dump_folder, frame);
-				if (video_hashes.is_open())
-				{
-					char text[48];
-					std::snprintf(text, sizeof(text), "%" PRIu64 " %016" PRIx64 "\n", frame, picture_hash());
-					video_hashes << text;
-				}
-				if (video_dump_frames.count(frame))
-					write_bmp(video_folder + "/frame_" + std::to_string(frame) + ".bmp");
+			};
+			g_frame_vblank = [&]() {
+				frame = md_board.frame;
+				g_frame = frame;
+				end_frame(frame, md_frames_now());
+				if (frame >= frames)
+					throw frames_done();
+			};
+			try
+			{
+				if (frames)
+					for (;;)
+						cpu.run(1 << 20);
+			}
+			catch (const frames_done &)
+			{
 			}
 		}
-		frame--;
+		else
+		{
+			for (frame = 1; frame <= frames; frame++)
+			{
+				const uint64_t base = (frame - 1) * MD_FRAME_CLOCKS;
+				g_frame = frame;
+				g_profiling = !profile_path.empty() && frame > profile_from;
+				for (unsigned line = 0; line < MD_LINES; line++)
+				{
+					const uint64_t time = base + uint64_t(line) * MD_LINE_CLOCKS;
+					run_until(cpu, time);
+					if (g_sound)
+						ms_run_until(time);
+					md_line_start(line);
+					sync_irq();
+					if (video && line < MD_VDP_HEIGHT)
+						md_vdp_render_line(&md_board.vdp, line, &g_picture[size_t(line) * MD_VDP_WIDTH]);
+					if (line != MD_ACTIVE_LINES)
+						continue;
+
+					// VBLANK: the frame ends
+					end_frame(frame, time);
+				}
+			}
+			frame--;
+		}
 	}
 	catch (const std::exception &error)
 	{
