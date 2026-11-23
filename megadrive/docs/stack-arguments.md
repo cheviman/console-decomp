@@ -51,3 +51,15 @@ its caller's stack (`konami_cpu/decompile.py`). The data flow's `("s", offset, p
 slots, not parameters.
 
 Full per-cause counts, examples and how the sites were found: spinball-decomp session notes `stack_address_causes.md`.
+
+## The model that was built (23-11-2026, arcade-decomp branch `stack-arguments`, 7098149)
+
+`decompiler/stackargs.py`, off by default (profile flag `STACK_ARGUMENTS`): each argument a callee reads at `(n,A7)` /
+`(n,A6)` is a virtual register of the data flow (`arg_n`, a word or a long as the callee reads it); the callee reads the
+register (a slot copy of it where it reads it after a call of its own or writes it), the caller sets the registers of what
+its callees read from the slots it pushed before every call and tail call (`Call.sp`), and the lift's two 16-bit stores of a
+pushed long are one 32-bit slot. With the temporaries followed in `stack.slots()` (layer 1) the C writer goes from 321
+functions it cannot write to 34 on Sonic Spinball, 206 of the 372 written take `arg_n` parameters, and the calls pass them
+(checked against the asm on 10 caller/callee pairs). Left: 25 functions that use the address of a local buffer, 8 that use one
+slot at two widths, 1 that reads its return address. Other games' C is byte for byte the same with the flag off.
+Details and the lists: spinball-decomp session notes `stack_arguments_model.md`.
