@@ -82,3 +82,31 @@ The model's fallback for the first two is the V60's memory stack (`stack.MEMORY_
 console's RAM, so any address into it is a real one; on the 68000 it needs a bridge to the `arg_n` registers (push them on
 entry, read the pushed ones back into `arg_n` before each call). It would also take the variable-size buffers the check
 still refuses (0F3B3E, 0F5A7A, 0FFAAE, 0F47D2).
+
+## The memory stack and the slots at two widths (24-11-2026, arcade-decomp branch `memory-stack`)
+
+- **Frames in memory** (profile flag `MEMORY_STACK`, off by default): a function that still has a `stack_address` marker
+  after `stack.slots()` is marked `memory_frame`. Its slots serve the data flow as before (the arguments become `arg_n`,
+  `preserved.py` drops the `movem` saves), and only then `stack.to_memory()` puts its frame in the console's RAM: it
+  lowers the global `stack_pointer` (register 32, `stack.MEMORY_SP`, starting at the reset vector's SSP) past the deepest
+  place its stack reaches, each slot is `mem_read/mem_write(stack_pointer + n)`, a stack address is `stack_pointer + n`,
+  and `stack_pointer` goes back up before each return. Callers and callees keep passing `arg_n` registers, so slot-mode and
+  memory-mode functions mix. One that takes the address of its own arguments (0D6B88 `lea ($20,A7),A1` uses its first
+  argument's slot as a 2-byte buffer) stores all of them in its frame first. Checked against the asm by one worker task per
+  function (each `stack_pointer + n` against the `(d,A6)`/`(d,A7)` it stands for); the 0D6B88 case came from it. Putting the stack in RAM before the analysis (the V60's way) made every saved register a
+  parameter of these functions (d2..a6), which is why the conversion comes last.
+- **Slots at two widths** (`stackargs.widen()`, with `STACK_ARGUMENTS`): accesses of the function's own stack whose extents
+  overlap are one slot of the whole extent (2 or 4 bytes), a narrower read is its part (big endian) and a narrower store
+  keeps the rest. It runs before the calls' setups, so a pushed long with a byte stored inside it (0F4714) passes too. A
+  frame that goes to memory is left as it is: there each access keeps the asm's width.
+- **A LINK's saved A6 was marked as a stack address:** `slots()` replaced a frame register's reads with the frame's address
+  using the frames at the end of the block, so `link A6` pushed "the new A6" instead of the caller's. Now each statement
+  keeps the frames as they were when it was read. Nothing written changed (Spinball's C identical with the fix alone), but
+  105 functions looked like they hand on a stack address; 44 really do.
+- **Frame builders are not functions:** each call of one (FRAME_BUILDERS) is its instructions in the caller, so 0F6088 is
+  no longer written (it read its return address).
+
+On Sonic Spinball the C writer goes from 34 refused functions to 0 (405 written: 25 with their frame in RAM, 8 with joined
+slots), and the check from 8 to 7: the functions whose SP the slots cannot follow (a buffer of computed size 0F3B3E, bytes
+pushed in a loop 0FFAAE and 0F5A7A, script arguments pushed in a loop 0F47D2, pops deferred through shared code 0FA588, a
+piece of a function named as one 0E6942, unreached code 0D54C8), with 102 callers behind them (76 behind `format_decimal`).
