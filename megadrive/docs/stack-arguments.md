@@ -63,3 +63,22 @@ functions it cannot write to 34 on Sonic Spinball, 206 of the 372 written take `
 (checked against the asm on 10 caller/callee pairs). Left: 25 functions that use the address of a local buffer, 8 that use one
 slot at two widths, 1 that reads its return address. Other games' C is byte for byte the same with the flag off.
 Details and the lists: spinball-decomp session notes `stack_arguments_model.md`.
+
+## What the 34 left do (24-11-2026, one worker task per function over the asm, spot-checked)
+
+- **Address of a local handed to a callee (about 10):** an output word or long the callee fills (0E1D10 to 0DBC60, 0E7268
+  to 0DB900, 0F3676, 0F4DFE and 0F4F2A to 0F3FE6, 0F56D0 and 0F5D02 to 0F42FE), and the palette fades' 0x20 to 0x100 byte
+  buffers handed to 0F3AA4, 0F3AE0 and `fill_bytes` (0F3200, 0F3362, 0F34AE, 0F52EC, 0F5E0E). The callees read and write
+  through the pointer with ordinary memory accesses, so the buffer must have a console address: a host C array does not fit.
+- **A buffer walked in the function itself (the rest):** `movea.l A7,A0` or `lea (-n,A6),An` then `(An)+` / `(n,An)`
+  (0F43E0, 0F4430, 0F4492 read the VDP into the stack and write it back; 0FE376, 0D61EA, 0DB900, 0F2F96, 0F3148).
+- **One slot at two widths (8):** a long stored and its high word read back (0DBC60, 0DBCEA); a word whose high byte is
+  changed with `andi.b`/`ori.b`/`bset` (0F49B8, 0F4AE4, 0F5122); and the outgoing argument area reused for another call at
+  another width (0F2946, 0F4D2A, 0F5522: `subq.l #2,A7; move.w x,-(A7)` where a long was pushed before), which are two
+  different variables at one offset.
+- **0F6088 reads its return address:** the GEMS frame builder, whose every call FRAME_BUILDERS already puts in its sender.
+
+The model's fallback for the first two is the V60's memory stack (`stack.MEMORY_SP`): the function's whole frame stays in the
+console's RAM, so any address into it is a real one; on the 68000 it needs a bridge to the `arg_n` registers (push them on
+entry, read the pushed ones back into `arg_n` before each call). It would also take the variable-size buffers the check
+still refuses (0F3B3E, 0F5A7A, 0FFAAE, 0F47D2).
