@@ -110,3 +110,47 @@ On Sonic Spinball the C writer goes from 34 refused functions to 0 (405 written:
 slots), and the check from 8 to 7: the functions whose SP the slots cannot follow (a buffer of computed size 0F3B3E, bytes
 pushed in a loop 0FFAAE and 0F5A7A, script arguments pushed in a loop 0F47D2, pops deferred through shared code 0FA588, a
 piece of a function named as one 0E6942, unreached code 0D54C8), with 102 callers behind them (76 behind `format_decimal`).
+
+## The whole stack in memory, for SP the slots cannot follow (24-11-2026, arcade-decomp branch `whole-memory-stack`)
+
+The 7 functions the check still refused were three different things:
+
+- **SP the slots cannot follow (5):** bytes pushed in a loop and popped in another (0FFAAE `format_decimal`, 0F5A7A),
+  script arguments pushed in a loop for a call through a register (0F47D2), a buffer of a size the code computes
+  (0F3B3E: `suba.w D1, A7` twice), and calls whose arguments the compiler pops later, after ways meet (0FA588: 0FE2CC
+  calls twice without popping and meets 0FE2B8's way at 0FE2E4, 8 bytes deeper; GCC's deferred pop). With
+  `MEMORY_STACK` on, `stack.analyse()` no longer gives up when `slots()` does: `stack.whole()` keeps the function's
+  whole stack in RAM from its start, as the 68000 does (SP is `stack_pointer`, every push, pop and `(n,A7)` access is
+  `mem_read/mem_write`, A6 holds a real address). What the slots gave the data flow is found where SP is known,
+  followed from the start where every way agrees, and counted back from each return (where SP must be where it started):
+  the arguments it reads (`stackargs.in_memory()` lowers `stack_pointer` past them as the function starts and stores
+  their `arg_n` registers there; before each call the callees' `arg_n` are read from `stack_pointer + n - 4`, as no
+  return address is pushed; a jump to another function takes them from the function's own places), and the registers it
+  saves as it starts and puts back from the same bytes on every way out, which stay slots for `preserved.py`. SP set from
+  anything but SP or a frame is still an error, and so is a known SP that differs from what the ways out need.
+- **A piece of a function named as one (0E6942):** the `jsr` in the middle of 0E65DA's code, which only the instruction
+  before runs into. `LABELS_NOT_ENTRIES` now also takes a named place that only the previous instruction runs into (no
+  call, no table, no computed jump; a frame builder's rest stays) as a place of the code that leads there. The code that
+  leads there has an overlapping instruction (0E693E `ori.b #$12, D4` is the operand word of 0E693C's `pea $4.w` and of
+  0E6940's `move.l (A2), -(A7)`), so where an overlapping instruction goes on now starts a block.
+- **Unreached code (0D54C8):** the end of 0D527A past the jump that closes its loop, which puts back what 0D527A saved
+  and returns with SP 20 bytes above where it started. No function of its own can have that stack: code symbols.txt
+  names `unreached_` whose stack cannot be followed, and that nothing calls or jumps to, is left out of the C.
+
+Also `stackargs.extract()`: three bytes (the rest of a long a byte is stored into, 0F4764 `move.b (A0)+, ($3,A7)`) are the
+long masked, not a 24-bit value the data flow has no mask for; 0F4714 was behind format_decimal before.
+
+On Sonic Spinball the check goes from 7 to 0 and the C writer writes all 512 functions (405 before; the 102 callers that
+were left out are in). Checked against the asm: format_decimal and copy_vram_words line by line, 0FA588's entry, calls
+and exit, and one worker task per function for the other four (all its mismatches were misreadings). TMNT's C is byte
+for byte the same; The Simpsons runs no code this changes. What is left:
+
+- 0F3B3E's saves of D1/A1/A2 are put back after `adda.w D1, A7` twice, at an SP the code computes, so they go through
+  memory and the three registers are in/out parameters (following SP plus a value read from an argument would resolve it).
+- A save by `move.l Dn,-(A7)` or `move.w` and its pop set the flags from the register, so `preserved.py` keeps them (the
+  temporary that feeds the save also feeds the flags): format_decimal hands D2 back, 0F47D2 D7. The same holds in
+  functions with slots (udiv32's D2 before this change); with the whole program written, 109 functions hand back a
+  register their callers expect kept (23 before, of the 405).
+- The data flow takes about 14 minutes for its first pass over the whole program, spread over the big functions
+  it solves again and again (0D8F22, slots, 107 s in 38 runs; 0FA588, 19,208 statements, 93 s in 25), and writing the
+  C about half an hour.
