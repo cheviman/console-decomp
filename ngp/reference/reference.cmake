@@ -2,8 +2,8 @@
 # Description: builds the reference tools of a Neo Geo Pocket Color game on MAME's cores: ngpref (the original
 #              program and the console's BIOS on MAME's TMP95C061, with MAME's Z80, T6W28 and K2GE),
 #              test_k2ge and test_k2ge_registers (the runtime's K2GE against MAME's), test_flash (the
-#              board's flash against MAME's), test_ngpsound (the sound side) and test_t6w28 (the runtime's
-#              T6W28 against MAME's)
+#              board's flash against MAME's), test_ngpsound (the sound side), test_t6w28 (the runtime's
+#              T6W28 against MAME's) and test_tmp95c061 (the runtime's TMP95C061 devices against MAME's)
 # Version:     0.1.0
 # Created:     26-11-2026
 # Modified:    27-11-2026
@@ -104,6 +104,14 @@ add_executable(test_flash ${NGP_REFERENCE}/test_flash.cpp)
 target_link_libraries(test_flash PRIVATE ngp_runtime)
 if(MSVC)
 	target_compile_options(test_flash PRIVATE ${NGP_MSVC_WARNINGS})
+endif()
+
+# The check of the runtime's TMP95C061 devices (ngp/tmp95c061.h) against MAME's, on random writes, reads,
+# input lines, runs, micro DMA and interrupt checks
+add_executable(test_tmp95c061 ${NGP_REFERENCE}/test_tmp95c061.cpp)
+target_link_libraries(test_tmp95c061 PRIVATE ngp_tlcs900_reference ngp_runtime)
+if(MSVC)
+	target_compile_options(test_tmp95c061 PRIVATE ${NGP_MSVC_WARNINGS})
 endif()
 
 # ngpref

@@ -41,6 +41,13 @@
  *    of the VBLANK and HBLANK lines; the runtime's lines are drawn from that memory. The runtime's T6W28
  *    (ngp/t6w28.h) runs beside MAME's in the sound side (ngpsound.cpp), and the run ends saying how many of its
  *    sample values differed.
+ *
+ *    The runtime's TMP95C061 devices (ngp/tmp95c061.h) run beside MAME's: they get the same register writes
+ *    and input lines, and after every instruction the same cycles; every read, the interrupt each check takes
+ *    (its vector, the PC and the IFF), the micro DMA's cycles and bus bytes (MAME's reads replayed), and after
+ *    every step the timers, the A/D, the lines, the requests and port A's writes are compared, and every
+ *    register at the end of every frame. The TMP95C061 is built in zeroed memory, as MAME's constructors and
+ *    device_reset leave some of the core's members unset.
  */
 #include "emu.h"
 #include "tmp95c061.h"
@@ -52,6 +59,7 @@
 #include "ngpsound.h"
 #include "k2gevideo.h"
 #include "ngp/k2ge.h"
+#include "ngp/tmp95c061.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -119,7 +127,20 @@ public:
 		return text.str();
 	}
 
+	// The runtime's registers (ngp/tmp95c061.h) against MAME's, at the end of a frame
+	void compare_registers(uint64_t frame);
+
+protected:
+	// The runtime's TMP95C061 beside this one: MAME's execute_run calls these around each instruction, and each
+	// runs MAME's, then the runtime's, and compares them (below, with the runtime's chip)
+	void execute_set_input(int line, int state) override;
+	void tlcs900_handle_timers() override;
+	void tlcs900_check_hdma() override;
+	void tlcs900_check_irqs() override;
+
 private:
+	void compare_beside(const char *where);
+
 	std::unique_ptr<util::disasm_interface> m_disassembler;
 };
 
@@ -181,13 +202,33 @@ void record_rom_read(uint32_t address)
 		g_rom_reads.insert(uint64_t(g_instruction_pc) << 24 | address);
 }
 
+// While MAME's micro DMA runs (its check after every instruction), its bus's bytes are recorded, for the
+// runtime's to replay and be compared with (the runtime's TMP95C061, below)
+struct bus_access
+{
+	bool write;
+	uint32_t address;
+	uint8_t data;
+	bool operator==(const bus_access &other) const
+	{
+		return write == other.write && address == other.address && data == other.data;
+	}
+};
+bool g_hdma_recording = false;
+std::vector<bus_access> g_mame_hdma_bus;
+
 uint8_t bus_r8(offs_t address)
 {
-	return ngp_read8(address);
+	const uint8_t data = ngp_read8(address);
+	if (g_hdma_recording)
+		g_mame_hdma_bus.push_back({ false, uint32_t(address), data });
+	return data;
 }
 
 void bus_w8(offs_t address, uint8_t data)
 {
+	if (g_hdma_recording)
+		g_mame_hdma_bus.push_back({ true, uint32_t(address), data });
 	ngp_write8(address, data);
 }
 
@@ -218,11 +259,277 @@ void bus_w32(offs_t address, uint32_t data)
 
 // ---- what the board asks of the chips (its hooks) ----
 
-// The TMP95C061's own registers (000000-00007F), through its internal map
+// ---- the runtime's TMP95C061 (ngp/tmp95c061.h) beside MAME's ----
+// MAME's execute_run calls the four overrides around each instruction: they run MAME's, then the
+// runtime's, and compare the chip's state (compare_beside) and the bus's bytes of the micro DMA
+// (tlcs900_check_hdma). The internal registers are read and written beside MAME's (runtime_internal_read
+// and runtime_internal_write, called by internal_read and internal_write), the ports' writes are kept
+// apart and compared, and the registers are compared at the end of every frame (compare_registers).
+
+ngp_tmp95c061 g_runtime_cpu;
+std::vector<std::pair<unsigned, uint8_t>> g_mame_port_writes, g_runtime_port_writes;
+std::vector<bus_access> g_runtime_hdma_bus;
+size_t g_hdma_replay = 0;              // the next of MAME's bytes a read of the runtime's takes
+uint64_t g_cpu_reads_unlike = 0, g_cpu_states_unlike = 0, g_cpu_irqs_unlike = 0, g_cpu_dma_unlike = 0,
+	g_cpu_registers_unlike = 0, g_cpu_irqs_taken = 0, g_cpu_dma_moves = 0;
+std::string g_cpu_first_unlike;
+
+void note_cpu_unlike(uint64_t &count, const std::string &what)
+{
+	if (!count++ && g_cpu_first_unlike.empty())
+		g_cpu_first_unlike = what;
+}
+
+// The host's bus hooks: the bytes of MAME's micro DMA, replayed by ngp_tmp95c061_dma; a read takes MAME's
+// next read (its writes skipped), which must be of the same address, and every byte is kept in
+// g_runtime_hdma_bus to be compared with MAME's whole sequence
+uint8_t runtime_bus_read8(uint32_t address)
+{
+	while (g_hdma_replay < g_mame_hdma_bus.size() && g_mame_hdma_bus[g_hdma_replay].write)
+		g_hdma_replay++;
+	uint8_t data = 0;
+	if (g_hdma_replay < g_mame_hdma_bus.size())
+	{
+		const bus_access &entry = g_mame_hdma_bus[g_hdma_replay++];
+		if (entry.address == address)
+			data = entry.data;
+	}
+	g_runtime_hdma_bus.push_back({ false, address, data });
+	return data;
+}
+
+void runtime_bus_write8(uint32_t address, uint8_t data)
+{
+	g_runtime_hdma_bus.push_back({ true, address, data });
+}
+
+uint16_t runtime_bus_read16(uint32_t address)
+{
+	return uint16_t(runtime_bus_read8(address) | (runtime_bus_read8(address + 1) << 8));
+}
+
+uint32_t runtime_bus_read32(uint32_t address)
+{
+	const uint16_t low = runtime_bus_read16(address);
+	return uint32_t(low) | (uint32_t(runtime_bus_read16(address + 2)) << 16);
+}
+
+void runtime_bus_write16(uint32_t address, uint16_t data)
+{
+	runtime_bus_write8(address, uint8_t(data));
+	runtime_bus_write8(address + 1, uint8_t(data >> 8));
+}
+
+void runtime_bus_write32(uint32_t address, uint32_t data)
+{
+	runtime_bus_write16(address, uint16_t(data));
+	runtime_bus_write16(address + 2, uint16_t(data >> 16));
+}
+
+// ngp.cpp binds port A's write only (TO3 to the Z80's IRQ): another port's write reaches nothing
+void runtime_port_write(unsigned port, uint8_t data)
+{
+	if (port == NGP_TMP95C061_PORT_A)
+		g_runtime_port_writes.push_back({ port, data });
+}
+
+uint16_t runtime_an_read(unsigned channel)
+{
+	return channel == 0 ? 0x3ff : 0;
+}
+
+static const ngp_tmp95c061_host g_runtime_cpu_host = {
+	runtime_port_write,
+	nullptr,
+	runtime_an_read,
+	runtime_bus_read8,
+	runtime_bus_read16,
+	runtime_bus_read32,
+	runtime_bus_write8,
+	runtime_bus_write16,
+	runtime_bus_write32,
+};
+
+// The chip built as MAME's is (main calls it after cpu.start(), and ngp_tmp95c061_reset after cpu.reset():
+// the K2GE's reset calls the CPU's lines between the two)
+void runtime_cpu_start()
+{
+	ngp_tmp95c061_init(&g_runtime_cpu, &g_runtime_cpu_host);
+}
+
+void runtime_internal_read(uint32_t address, uint8_t data)
+{
+	const uint8_t runtime = g_machine.m_side_effects_disabled ? ngp_tmp95c061_peek(&g_runtime_cpu, address)
+		: ngp_tmp95c061_read(&g_runtime_cpu, address);
+	if (runtime != data)
+	{
+		char text[96];
+		std::snprintf(text, sizeof(text), "a read of %02X at %" PRIu64 ": MAME %02X, runtime %02X", unsigned(address),
+			now(), data, runtime);
+		note_cpu_unlike(g_cpu_reads_unlike, text);
+	}
+}
+
+void runtime_internal_write(uint32_t address, uint8_t data)
+{
+	ngp_tmp95c061_write(&g_runtime_cpu, address, data);
+}
+
+void reference_cpu::compare_beside(const char *where)
+{
+	// A call with differences counts once; the run's first is described
+	bool unlike = false;
+	auto note = [where, &unlike](const char *name, uint32_t mame, uint32_t runtime) {
+		if (!unlike && g_cpu_first_unlike.empty())
+		{
+			char text[160];
+			std::snprintf(text, sizeof(text), "%s at %" PRIu64 ", %s: MAME %08X, runtime %08X (frame %" PRIu64
+				", PC %06X)", where, now(), name, mame, runtime, now() / kFrame, g_cpu->pc());
+			g_cpu_first_unlike = text;
+		}
+		unlike = true;
+	};
+	if (m_timer_pre != g_runtime_cpu.timer_pre)
+		note("timer_pre", m_timer_pre, g_runtime_cpu.timer_pre);
+	for (int index = 0; index < 6; index++)
+		if (m_timer_8[index] != g_runtime_cpu.timer_8[index])
+			note("timer_8", m_timer_8[index], g_runtime_cpu.timer_8[index]);
+	for (int index = 0; index < 4; index++)
+		if (m_timer_change[index] != g_runtime_cpu.timer_change[index])
+			note("timer_change", uint32_t(m_timer_change[index]), uint32_t(g_runtime_cpu.timer_change[index]));
+	if (m_ad_cycles_left != g_runtime_cpu.ad_cycles_left)
+		note("ad_cycles_left", uint32_t(m_ad_cycles_left), uint32_t(g_runtime_cpu.ad_cycles_left));
+	if (uint32_t(m_nmi_state == ASSERT_LINE) != g_runtime_cpu.nmi_state)
+		note("nmi_state", uint32_t(m_nmi_state == ASSERT_LINE), g_runtime_cpu.nmi_state);
+	static const int lines[5] = { TLCS900_NMI, TLCS900_INT0, TLCS900_INT4, TLCS900_INT5, TLCS900_TIO };
+	for (int index = 0; index < 5; index++)
+		if (uint32_t(m_level[lines[index]] == ASSERT_LINE) != g_runtime_cpu.level[index])
+			note("level", uint32_t(m_level[lines[index]] == ASSERT_LINE), g_runtime_cpu.level[index]);
+	if (!m_check_irqs && g_runtime_cpu.check_irqs)
+		note("check_irqs", 0, 1);
+	g_machine.m_side_effects_disabled = true;
+	for (int index = 0; index < NGP_TMP95C061_INT_REGS; index++)
+	{
+		const address_map::entry *entry = g_internal[0x70 + index];
+		const uint8_t mame = entry && entry->read ? entry->read(0x70 + index - entry->start) : 0;
+		if (mame != g_runtime_cpu.int_reg[index])
+			note("int_reg", mame, g_runtime_cpu.int_reg[index]);
+	}
+	g_machine.m_side_effects_disabled = false;
+	if (g_mame_port_writes != g_runtime_port_writes)
+		note("the ports' writes (their count)", uint32_t(g_mame_port_writes.size()),
+			uint32_t(g_runtime_port_writes.size()));
+	g_mame_port_writes.clear();
+	g_runtime_port_writes.clear();
+	if (unlike)
+		g_cpu_states_unlike++;
+}
+
+void reference_cpu::execute_set_input(int line, int state)
+{
+	const int runtime_line = line == TLCS900_NMI ? NGP_TMP95C061_NMI : line == TLCS900_INT0 ? NGP_TMP95C061_INT0
+		: line == TLCS900_INT4 ? NGP_TMP95C061_INT4 : line == TLCS900_INT5 ? NGP_TMP95C061_INT5
+		: line == TLCS900_TIO ? NGP_TMP95C061_TIO : -1;
+	const bool known = runtime_line >= 0;
+	const int released = runtime_line < 0 ? 0 : ngp_tmp95c061_set_input(&g_runtime_cpu, runtime_line, state == ASSERT_LINE);
+	if (runtime_line < 0)
+		g_runtime_cpu.check_irqs = 1;
+	const int kept = m_halted;
+	m_halted = 1;
+	tmp95c061_device::execute_set_input(line, state);
+	const bool mame_released = m_halted == 0;
+	m_halted = mame_released ? 0 : kept;
+	if (known && released != (mame_released ? 1 : 0))
+		note_cpu_unlike(g_cpu_states_unlike, "an input: HALT released by one chip and not the other");
+	compare_beside("an input");
+}
+
+void reference_cpu::tlcs900_handle_timers()
+{
+	tmp95c061_device::tlcs900_handle_timers();
+	ngp_tmp95c061_run(&g_runtime_cpu, m_cycles);
+	compare_beside("an instruction");
+}
+
+void reference_cpu::tlcs900_check_hdma()
+{
+	for (int channel = 0; channel < 4; channel++)
+	{
+		g_runtime_cpu.dmas[channel] = m_dmas[channel].d;
+		g_runtime_cpu.dmad[channel] = m_dmad[channel].d;
+		g_runtime_cpu.dmac[channel] = m_dmac[channel].w.l;
+		g_runtime_cpu.dmam[channel] = m_dmam[channel].b.l;
+	}
+	const int kept = m_cycles;
+	g_mame_hdma_bus.clear();
+	g_hdma_recording = true;
+	tmp95c061_device::tlcs900_check_hdma();
+	g_hdma_recording = false;
+	g_runtime_hdma_bus.clear();
+	g_hdma_replay = 0;
+	const int cycles = ngp_tmp95c061_dma(&g_runtime_cpu, (m_sr.b.h >> 4) & 7);
+	if (cycles != m_cycles - kept || g_runtime_hdma_bus != g_mame_hdma_bus)
+		note_cpu_unlike(g_cpu_dma_unlike, "the micro DMA: the cycles or the bus's bytes");
+	if (cycles > 0)
+		g_cpu_dma_moves++;
+	compare_beside("the micro DMA");
+}
+
+void reference_cpu::tlcs900_check_irqs()
+{
+	ngp_tmp95c061_irq irq = {};
+	const bool runtime_pending = ngp_tmp95c061_pending(&g_runtime_cpu, (m_sr.b.h >> 4) & 7, &irq);
+	const int kept_cycles = m_cycles;
+	const int kept_iff = (m_sr.b.h >> 4) & 7;
+	tmp95c061_device::tlcs900_check_irqs();
+	const bool mame_taken = m_cycles > kept_cycles;
+	if (runtime_pending)
+	{
+		ngp_tmp95c061_acknowledge(&g_runtime_cpu, &irq);
+		g_cpu_irqs_taken++;
+		g_machine.m_side_effects_disabled = true;
+		const uint32_t vector = bus_r32(0xffff00 + irq.vector);
+		g_machine.m_side_effects_disabled = false;
+		const int new_iff = (m_sr.b.h >> 4) & 7;
+		if (!mame_taken || m_pc.d != vector || new_iff != (irq.level == NGP_TMP95C061_KEEP_IFF ? kept_iff : irq.level))
+			note_cpu_unlike(g_cpu_irqs_unlike, "an interrupt: MAME's, the runtime's, or the PC or the IFF");
+	}
+	else if (mame_taken)
+		note_cpu_unlike(g_cpu_irqs_unlike, "an interrupt: MAME took one, the runtime did not");
+	compare_beside("an interrupt check");
+	g_runtime_cpu.check_irqs = 0;
+}
+
+void reference_cpu::compare_registers(uint64_t frame)
+{
+	g_machine.m_side_effects_disabled = true;
+	for (uint32_t offset = 0; offset < 0x80; offset++)
+	{
+		if (offset >= 0x60 && offset <= 0x67)
+			continue;
+		const address_map::entry *entry = g_internal[offset];
+		const uint8_t mame = entry && entry->read ? entry->read(offset - entry->start) : 0;
+		const uint8_t runtime = ngp_tmp95c061_peek(&g_runtime_cpu, offset);
+		if (mame != runtime)
+		{
+			char text[96];
+			std::snprintf(text, sizeof(text), "a register at the end of frame %" PRIu64 ", %02X: MAME %02X, runtime %02X",
+				frame, unsigned(offset), mame, runtime);
+			note_cpu_unlike(g_cpu_registers_unlike, text);
+			break;
+		}
+	}
+	g_machine.m_side_effects_disabled = false;
+}
+
+// The TMP95C061's own registers (000000-00007F), through its internal map; the runtime's are read and written
+// beside them
 uint8_t internal_read(uint32_t address)
 {
 	const address_map::entry *entry = g_internal[address];
-	return entry && entry->read ? entry->read(address - entry->start) : 0;
+	const uint8_t data = entry && entry->read ? entry->read(address - entry->start) : 0;
+	runtime_internal_read(address, data);
+	return data;
 }
 
 void internal_write(uint32_t address, uint8_t data)
@@ -230,6 +537,7 @@ void internal_write(uint32_t address, uint8_t data)
 	const address_map::entry *entry = g_internal[address];
 	if (entry && entry->write)
 		entry->write(address - entry->start, data);
+	runtime_internal_write(address, data);
 }
 
 // The sound side, at the present
@@ -865,7 +1173,9 @@ int main(int argc, char **argv)
 	ngp_board.controls = g_controls;               // held at power on: no NMI for them
 
 	// The TMP95C061 (MAME's ngp_common): an 8-bit bus, port A to the Z80's IRQ, the main battery full
-	reference_cpu cpu(g_config);
+	// Static, so built in zeroed memory: MAME's constructors and device_reset leave some of the core's members
+	// unset (m_timer_8 and, until the reset, m_timer_pre), which the runtime's chip compares
+	static reference_cpu cpu(g_config);
 	g_cpu = &cpu;
 	cpu.set_am8_16(1);
 	cpu.space(AS_PROGRAM).r8 = bus_r8;
@@ -875,11 +1185,15 @@ int main(int argc, char **argv)
 	cpu.space(AS_PROGRAM).w16 = bus_w16;
 	cpu.space(AS_PROGRAM).w32 = bus_w32;
 	cpu.space(AS_PROGRAM).width = 8;
-	cpu.porta_write().set([](offs_t, uint8_t data) { ngp_port_a(data); });
+	cpu.porta_write().set([](offs_t, uint8_t data) {
+		g_mame_port_writes.push_back({ NGP_TMP95C061_PORT_A, data });
+		ngp_port_a(data);
+	});
 	cpu.an_read<0>().set([] { return uint16_t(0x3ff); });
 	cpu.instruction_hook = on_instruction;
 	cpu.log_handler = [](const std::string &message) { std::cerr << message; };
 	cpu.start();
+	runtime_cpu_start();
 	for (const address_map::entry &entry : cpu.internal_map().m_entries)
 		for (offs_t address = entry.start; address <= entry.end && address < 0x80; address++)
 			g_internal[address] = &entry;
@@ -908,6 +1222,7 @@ int main(int argc, char **argv)
 	// MAME's machine_reset (TO3 low: ngp_power_on): the CPU from its reset vector, or the BIOS's restart when the
 	// NVRAM was loaded
 	cpu.reset();
+	ngp_tmp95c061_reset(&g_runtime_cpu);
 	if (nvram_loaded)
 		cpu.set_pc(0xff1800);
 
@@ -933,6 +1248,7 @@ int main(int argc, char **argv)
 		ns_end_frame(time);
 		compare_runtime_picture(frame);
 		compare_runtime_registers(frame, time);
+		g_cpu->compare_registers(frame);
 		if (sound_hashes.is_open())
 		{
 			char text[64];
@@ -1009,7 +1325,15 @@ int main(int argc, char **argv)
 	if (!g_runtime_first_register_unlike.empty())
 		std::cout << " (the first: " << g_runtime_first_register_unlike << ')';
 	std::cout << '\n'
-		<< "runtime T6W28 sample values unlike MAME's: " << ns_t6w28_unlike() << '\n';
+		<< "runtime T6W28 sample values unlike MAME's: " << ns_t6w28_unlike() << '\n'
+		<< "runtime TMP95C061 unlike MAME's: " << g_cpu_reads_unlike << " reads, " << g_cpu_states_unlike
+		<< " states, " << g_cpu_irqs_unlike << " interrupt checks, " << g_cpu_dma_unlike << " micro DMA checks, "
+		<< g_cpu_registers_unlike << " frames' registers";
+	if (!g_cpu_first_unlike.empty())
+		std::cout << " (the first: " << g_cpu_first_unlike << ')';
+	std::cout << '\n'
+		<< "runtime TMP95C061: " << g_cpu_irqs_taken << " interrupts taken, " << g_cpu_dma_moves
+		<< " micro DMA moves\n";
 	if (!trace_path.empty())
 		write_addresses(trace_path, g_executed, 1u << 24, 6, "TMP95C061 addresses executed by ngpref");
 	if (!jumps_path.empty())
