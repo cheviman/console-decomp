@@ -20,9 +20,12 @@
  *    happens at the right moment; the T6W28 is brought up to the present before each write. The Z80 starts
  *    stopped and runs only while the console lets it.
  *
- *    Not finished: of the 26 checks of test_ngpsound.cpp, 5 fail (two runs of the same calls give other
- *    hashes; the state's hash does not follow the shared RAM; the TMP95C061's writes to the T6W28 and the DACs
- *    do not reach the mix). The Z80's side passes: it runs, plays the T6W28 and talks to the TMP95C061.
+ *    Two things of MAME's that are not obvious: the T6W28 takes its tones' frequencies from port 1 only (the
+ *    Z80's 4001), and port 0 gives the right side's volumes; MAME's io_w writes the TMP95C061's 0000A0 and
+ *    0000A1 both to port 0, so the TMP95C061 alone can only change those volumes. And t6w28.cpp's
+ *    device_start leaves port 1's registers (m_register[8..15]) as the memory had them: the chips are built
+ *    in zeroed memory, so that they start at 0 and a run does not depend on the one before it.
+ *    test_ngpsound.cpp is the check.
  */
 #include "ngpsound.h"
 
@@ -78,6 +81,15 @@ bool g_z80_enabled = false;                 // the Z80 runs only when the consol
 class sound_cpu : public ns::z80_device
 {
 public:
+	// built in zeroed memory, as the T6W28 is (below)
+	static void *operator new(size_t size)
+	{
+		void *memory = ::operator new(size);
+		std::memset(memory, 0, size);
+		return memory;
+	}
+	static void operator delete(void *memory) { ::operator delete(memory); }
+
 	explicit sound_cpu(const ns::machine_config &config) : ns::z80_device(config, "audiocpu", nullptr, 3072000) {}
 
 	// how many of the slice's cycles have gone by
@@ -100,6 +112,15 @@ public:
 		return done - m_cut;
 	}
 
+	// the Z80's registers, for the state hash: PC, SP, AF (F as the flags are now), BC, DE, HL, IX, IY
+	void registers(uint16_t *out)
+	{
+		const ns::PAIR16 *pairs[] = { &m_pc, &m_sp, &m_af, &m_bc, &m_de, &m_hl, &m_ix, &m_iy };
+		for (int index = 0; index < 8; index++)
+			out[index] = pairs[index]->w;
+		out[2] = uint16_t((m_af.w & 0xff00) | get_f());
+	}
+
 private:
 	int m_cut = 0;
 };
@@ -107,6 +128,7 @@ private:
 ns::machine_config g_config;
 std::unique_ptr<sound_cpu> g_z80;
 uint8_t g_executed[0x10000 / 8];
+uint8_t *g_shared_ram = nullptr;            // the 4 KB both CPUs see, for the state hash
 
 uint64_t now()
 {
@@ -130,10 +152,12 @@ struct samples
 	}
 };
 
-// the T6W28's samples and the DACs' levels at each sample's time
+// the T6W28's samples and the DACs' levels at each sample's time, and the DACs' last written bytes
 samples g_t6w28_samples(2);
 std::vector<uint8_t> g_dac_left;
 std::vector<uint8_t> g_dac_right;
+uint8_t g_dac_left_value = 0;
+uint8_t g_dac_right_value = 0;
 
 // ---- the T6W28 ----
 
@@ -144,6 +168,17 @@ public:
 	{
 		stream().m_before_change = [this]() { catch_up(now()); };
 	}
+
+	// MAME leaves some members to whatever memory a device is built in (the T6W28's port 1 registers,
+	// m_register[8..15], which its device_start does not set): built in zeroed memory, they start at 0 in
+	// every run, and a run does not depend on the one before it
+	static void *operator new(size_t size)
+	{
+		void *memory = ::operator new(size);
+		std::memset(memory, 0, size);
+		return memory;
+	}
+	static void operator delete(void *memory) { ::operator delete(memory); }
 	void catch_up(uint64_t time)
 	{
 		const uint64_t due = samples_before(time, kT6w28Period);
@@ -164,15 +199,7 @@ public:
 		catch_up(now());
 		ns::t6w28_device::write(offset, data);
 	}
-
-private:
-	uint8_t g_dac_left_value = 0;
-	uint8_t g_dac_right_value = 0;
 };
-
-// the DACs' last written bytes
-uint8_t g_dac_left_value = 0;
-uint8_t g_dac_right_value = 0;
 
 std::unique_ptr<t6w28_chip> g_t6w28;
 
@@ -278,6 +305,10 @@ extern "C" void ns_attach(uint64_t time, uint8_t *shared_ram, const ns_host *hos
 	g_t6w28->set_enable(false);
 
 	g_time = time;
+	g_running = false;
+	g_slice_start = 0;
+	g_slice_budget = 0;
+	g_t6w28_samples.data.clear();
 	g_t6w28_samples.first = g_t6w28_samples.made = samples_before(time, kT6w28Period);
 	g_dac_left.clear();
 	g_dac_right.clear();
@@ -285,6 +316,9 @@ extern "C" void ns_attach(uint64_t time, uint8_t *shared_ram, const ns_host *hos
 	g_dac_right_value = 0;
 	g_z80_enabled = false;
 	g_z80_cycles = 0;
+	g_z80_pc = 0;
+	g_frame_samples_hash = 0;
+	g_shared_ram = shared_ram;
 	std::memset(g_executed, 0, sizeof(g_executed));
 	g_mix.clear();
 }
@@ -336,6 +370,7 @@ extern "C" void ns_psg_enable(uint64_t time, int enable)
 extern "C" void ns_dac_write(uint64_t time, int left, uint8_t data)
 {
 	run_to(time);
+	g_t6w28->catch_up(time);
 	if (left)
 		g_dac_left_value = data;
 	else
@@ -347,7 +382,6 @@ extern "C" void ns_end_frame(uint64_t time)
 	run_to(time);
 	g_t6w28->catch_up(time);
 
-	const uint64_t t6w28_first = g_t6w28_samples.first;
 	std::vector<float> t6w28;
 	uint64_t hash = 0xcbf29ce484222325ull;
 	hash = take(g_t6w28_samples, samples_before(time, kT6w28Period), hash, t6w28);
@@ -356,8 +390,8 @@ extern "C" void ns_end_frame(uint64_t time)
 	const size_t sample_count = t6w28.size() / 2;
 	for (size_t index = 0; index < sample_count; index++)
 	{
-		hash = hash_bytes(&g_dac_left[t6w28_first + index], 1, hash);
-		hash = hash_bytes(&g_dac_right[t6w28_first + index], 1, hash);
+		hash = hash_bytes(&g_dac_left[index], 1, hash);
+		hash = hash_bytes(&g_dac_right[index], 1, hash);
 	}
 	g_frame_samples_hash = hash;
 
@@ -366,13 +400,15 @@ extern "C" void ns_end_frame(uint64_t time)
 	g_mix.clear();
 	for (size_t index = 0; index < sample_count; index++)
 	{
-		const float left_dac = float(g_dac_left[t6w28_first + index]) / 255.0f;
-		const float right_dac = float(g_dac_right[t6w28_first + index]) / 255.0f;
+		const float left_dac = float(g_dac_left[index]) / 255.0f;
+		const float right_dac = float(g_dac_right[index]) / 255.0f;
 		const float left = 0.50f * t6w28[index * 2] + 0.25f * left_dac;
 		const float right = 0.50f * t6w28[index * 2 + 1] + 0.25f * right_dac;
 		g_mix.push_back(int16_t(std::clamp(int(left * 32768.0f), -32768, 32767)));
 		g_mix.push_back(int16_t(std::clamp(int(right * 32768.0f), -32768, 32767)));
 	}
+	g_dac_left.erase(g_dac_left.begin(), g_dac_left.begin() + ptrdiff_t(sample_count));
+	g_dac_right.erase(g_dac_right.begin(), g_dac_right.begin() + ptrdiff_t(sample_count));
 }
 
 extern "C" uint64_t ns_frame_samples_hash(void)
@@ -383,10 +419,12 @@ extern "C" uint64_t ns_frame_samples_hash(void)
 extern "C" uint64_t ns_state_hash(void)
 {
 	uint64_t hash = 0xcbf29ce484222325ull;
-	// the Z80's registers: PC, SP, AF, BC, DE, HL, IX, IY
-	// note: the stand-in's z80_device does not expose its registers directly;
-	// this hashes the Z80's internal state as best we can from the available API.
-	// If MAME's z80_device does not expose registers, this may need adjustment.
+	// the Z80's registers
+	uint16_t registers[8];
+	g_z80->registers(registers);
+	hash = hash_bytes(registers, sizeof(registers), hash);
+	// the 4 KB shared RAM
+	hash = hash_bytes(g_shared_ram, 0x1000, hash);
 	return hash;
 }
 

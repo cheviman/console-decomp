@@ -148,21 +148,25 @@ int main()
 	ns_end_frame(2 * kFrame);
 	expect(ns_z80_cycles() == stopped_at, "the Z80 ran after it was stopped");
 
-	// The TLCS-900/H's own writes: the T6W28 from the main side, then a DAC on the left only
+	// The TLCS-900/H's own writes reach the T6W28's port 0, the right side's volumes (MAME's io_w writes 0000A0
+	// and 0000A1 there; the tones' frequencies are port 1's): the Z80's tone plays on both sides, then the
+	// TLCS-900/H turns the right side's tone 0 off, and the right side goes flat while the left plays on
 	static const ns_host host = { comm_read, comm_write, int5 };
-	ns_attach(0, ram, &host);
-	ns_psg_enable(0, 1);
-	ns_psg_write(100, 0x90);
-	ns_psg_write(100, 0x8A);
-	ns_psg_write(100, 0x04);
-	ns_end_frame(kFrame);
+	one_frame(ram, 1000);
+	ns_psg_write(kFrame + 10, 0x9F);
+	ns_end_frame(2 * kFrame);
 	size_t count = 0;
 	const int16_t *mix = ns_frame_mix(&count);
-	bool main_tone = false;
-	for (size_t i = 0; i < count * 2; i++)
-		if (mix[i] != mix[0])
-			main_tone = true;
-	expect(main_tone, "the main CPU's T6W28 writes gave no sound");
+	bool left_plays = false, right_flat = true;
+	for (size_t i = 1; i < count; i++)
+	{
+		if (mix[i * 2] != mix[2])
+			left_plays = true;
+		if (mix[i * 2 + 1] != mix[3])
+			right_flat = false;
+	}
+	expect(left_plays, "the left side stopped when the TLCS-900/H turned the right side's tone off");
+	expect(right_flat, "the TLCS-900/H's write to port 0 did not turn the right side's tone off");
 
 	ns_attach(0, ram, &host);
 	ns_dac_write(kFrame / 2, 1, 0xFF);

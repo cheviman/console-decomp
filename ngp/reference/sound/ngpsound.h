@@ -51,7 +51,8 @@ void ns_z80_stop(uint64_t time);                     /* 0000B9 = AA: stopped (su
 void ns_z80_nmi(uint64_t time);                      /* 0000BA: an NMI pulse */
 void ns_z80_irq(uint64_t time);                      /* timer 3's output (TO3) rose: the Z80's IRQ raised */
 void ns_psg_write(uint64_t time, uint8_t data);      /* 0000A0 or 0000A1, while the TLCS-900/H drives it: the
-                                                        T6W28's port 0, as MAME's io_w writes both */
+                                                        T6W28's port 0, as MAME's io_w writes both (the right
+                                                        side's volumes: the frequencies are port 1's) */
 void ns_psg_enable(uint64_t time, int enable);       /* 0000B8 = 55 (1) or AA (0) */
 void ns_dac_write(uint64_t time, int left, uint8_t data);   /* 0000A2 (right, left = 0) or 0000A3 (left = 1) */
 
