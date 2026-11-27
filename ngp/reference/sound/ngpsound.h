@@ -65,8 +65,9 @@ uint64_t ns_frame_samples_hash(void);
 uint64_t ns_state_hash(void);
 
 /* The frame's samples mixed as MAME's ngp.cpp routes them (the T6W28's outputs 0 and 1 at 0.50 to the left
-   and the right, the left DAC at 0.25 to the left, the right DAC at 0.25 to the right), stereo, 16-bit, at the
-   T6W28's rate (ns_mix_rate: 192000 Hz) */
+   and the right, the left DAC at 0.25 to the left, the right DAC at 0.25 to the right, each DAC MAME's
+   DAC_8BIT_R2R: -1 + byte / 128), the sums taken down to a whole number with 1.0 as 32768, stereo, 16-bit, at
+   the T6W28's rate (ns_mix_rate: 192000 Hz) */
 const int16_t *ns_frame_mix(size_t *count);
 uint32_t ns_mix_rate(void);
 
@@ -80,6 +81,10 @@ uint16_t ns_z80_pc(void);
 /* The runtime's T6W28 (ngp/t6w28.h), run beside MAME's with the same writes and the same runs of samples: the
    values (two a sample) where it gave another than MAME's since ns_attach */
 uint64_t ns_t6w28_unlike(void);
+
+/* The runtime's mix (ngp/mix.h) of the runtime's T6W28 samples with the DACs' bytes, beside MAME's sums: the
+   values (two a sample) where it gave another since ns_attach */
+uint64_t ns_mix_unlike(void);
 
 #ifdef __cplusplus
 }

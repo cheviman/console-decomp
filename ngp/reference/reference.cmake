@@ -3,7 +3,8 @@
 #              program and the console's BIOS on MAME's TMP95C061, with MAME's Z80, T6W28 and K2GE),
 #              test_k2ge and test_k2ge_registers (the runtime's K2GE against MAME's), test_flash (the
 #              board's flash against MAME's), test_ngpsound (the sound side), test_t6w28 (the runtime's
-#              T6W28 against MAME's) and test_tmp95c061 (the runtime's TMP95C061 devices against MAME's)
+#              T6W28 against MAME's), test_mix (the runtime's mix against MAME's DACs and ngp.cpp's routes) and
+#              test_tmp95c061 (the runtime's TMP95C061 devices against MAME's)
 # Version:     0.1.0
 # Created:     26-11-2026
 # Modified:    27-11-2026
@@ -24,7 +25,7 @@ if(NOT NGP_ARCADE_CORE)
 endif()
 set(NGP_KONAMI_REFERENCE ${NGP_ARCADE_CORE}/konami/reference)
 set(NGP_SYSTEM32_REFERENCE ${NGP_ARCADE_CORE}/system32/reference)
-set(NGP_MSVC_WARNINGS /wd4244 /wd4267 /wd4100 /wd4146 /wd4127 /wd4018)
+set(NGP_MSVC_WARNINGS /wd4244 /wd4267 /wd4100 /wd4146 /wd4127 /wd4018 /wd4334)
 
 # MAME's TLCS-900/H core, its TMP95C061 and its disassembler, on tlcs900/stub's stand-in for MAME's emu.h
 add_library(ngp_tlcs900_reference STATIC
@@ -38,7 +39,7 @@ if(MSVC)
 	target_compile_options(ngp_tlcs900_reference PRIVATE /bigobj ${NGP_MSVC_WARNINGS})
 endif()
 
-# The sound side: MAME's Z80 (system32/reference's copy of the core) and T6W28, and the two DACs. The Z80
+# The sound side: MAME's Z80 (system32/reference's copy of the core), T6W28 and two DACs (dac.cpp). The Z80
 # core's steps are written from z80.lst at build time, as MAME does
 set(NGP_Z80 ${NGP_SYSTEM32_REFERENCE}/mame/z80)
 set(NGP_Z80_STEPS ${CMAKE_BINARY_DIR}/generated/cpu/z80/z80.hxx)
@@ -61,16 +62,22 @@ if(MSVC)
 endif()
 
 # The checks of the sound side: ngpsound.cpp against what ngpsound.h says (a Z80 program in the shared RAM),
-# and the runtime's T6W28 (ngp/t6w28.h) against MAME's t6w28.cpp on random writes and runs of samples
+# the runtime's T6W28 (ngp/t6w28.h) against MAME's t6w28.cpp on random writes and runs of samples, and the
+# runtime's mix (ngp/mix.h) against MAME's dac.cpp and ngp.cpp's routes on every T6W28 value with every byte
 add_executable(test_ngpsound ${NGP_REFERENCE}/sound/test_ngpsound.cpp)
 target_link_libraries(test_ngpsound PRIVATE ngp_sound_reference)
 add_executable(test_t6w28 ${NGP_REFERENCE}/sound/test_t6w28.cpp)
 target_include_directories(test_t6w28 PRIVATE ${NGP_KONAMI_REFERENCE}/sound ${NGP_REFERENCE}/mame)
 target_link_libraries(test_t6w28 PRIVATE ngp_runtime)
 target_compile_features(test_t6w28 PRIVATE cxx_std_20)
+add_executable(test_mix ${NGP_REFERENCE}/sound/test_mix.cpp)
+target_include_directories(test_mix PRIVATE ${NGP_KONAMI_REFERENCE}/sound ${NGP_REFERENCE}/mame)
+target_link_libraries(test_mix PRIVATE ngp_runtime)
+target_compile_features(test_mix PRIVATE cxx_std_20)
 if(MSVC)
 	target_compile_options(test_ngpsound PRIVATE ${NGP_MSVC_WARNINGS})
 	target_compile_options(test_t6w28 PRIVATE /bigobj ${NGP_MSVC_WARNINGS})
+	target_compile_options(test_mix PRIVATE /bigobj ${NGP_MSVC_WARNINGS})
 endif()
 
 # The video side: MAME's K2GE on video/stub's stand-in for MAME's emu.h

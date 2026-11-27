@@ -10,11 +10,15 @@
  *    license:BSD-3-Clause
  *    Built as arcade-decomp's konami/reference/sound/ksound.cpp is (the shared core, tools/core): MAME's
  *    files are included inside a namespace of their own (ns) after that folder's stand-in for MAME's emu.h,
- *    the Z80 core is system32/reference/mame/z80's (MAME 0.289's), the T6W28 is ngp/reference/mame's copy of
- *    MAME 0.289's t6w28.cpp (BSD-3-Clause, Wilbert Pol). As MAME's ngp.cpp wires them: the Z80's memory is
- *    the console's (shared RAM, the T6W28, the comm byte, the INT5 trigger), its INT line is the timer's,
- *    its NMI line is the console's; the Z80 runs at half the master clock, and the T6W28 at half the master
- *    clock too, making a sample every 16 of its clocks.
+ *    the Z80 core is system32/reference/mame/z80's (MAME 0.289's), the T6W28 and the DACs are ngp/reference/
+ *    mame's copies of MAME 0.289's t6w28.cpp (BSD-3-Clause, Wilbert Pol) and dac.cpp (BSD-3-Clause, smf). As
+ *    MAME's ngp.cpp wires them: the Z80's memory is the console's (shared RAM, the T6W28, the comm byte, the
+ *    INT5 trigger), its INT line is the timer's, its NMI line is the console's; the Z80 runs at half the
+ *    master clock, and the T6W28 at half the master clock too, making a sample every 16 of its clocks. The two
+ *    DACs are DAC_8BIT_R2R, with nothing routed into them: each gives -1 + byte / 128 until its next write.
+ *    The speaker sums 0.50 of each T6W28 output and 0.25 of its side's DAC (output 0 and the DAC at I/O 23 on
+ *    the left); the sum is exact in MAME's floats, and the mix written out (ns_frame_mix) is it taken down to
+ *    a whole number with 1.0 as 32768, at the T6W28's rate, each sample with the DACs' levels at its time.
  *
  *    The Z80 runs in slices that end where the console's time asks, so that a write to the T6W28 or a DAC
  *    happens at the right moment; the T6W28 is brought up to the present before each write. The Z80 starts
@@ -28,9 +32,11 @@
  *    test_ngpsound.cpp is the check.
  *
  *    Beside MAME's T6W28, the runtime's (ngp/t6w28.h) takes the same writes and makes the same runs of
- *    samples, and every value is compared with MAME's (ns_t6w28_unlike).
+ *    samples, and every value is compared with MAME's (ns_t6w28_unlike); the runtime's mix (ngp/mix.h) mixes
+ *    each run of its samples with the DACs' bytes, and every value is compared with MAME's sum (ns_mix_unlike).
  */
 #include "ngpsound.h"
+#include "ngp/mix.h"
 #include "ngp/t6w28.h"
 
 #include <algorithm>
@@ -59,6 +65,7 @@ namespace ns
 #include "z80.cpp"
 #include "z80dasm.cpp"
 #include "t6w28.cpp"
+#include "dac.cpp"
 }
 
 namespace
@@ -168,6 +175,17 @@ ngp_t6w28 g_runtime_t6w28;
 int16_t g_runtime_samples[2 * NGP_T6W28_MAX_RUN];
 uint64_t g_runtime_unlike = 0;
 
+// MAME's DACs (I/O 23 the left, 22 the right); a write is preceded by a catch_up (ns_dac_write), which is
+// what the DAC's own update before it does in MAME, so their streams are not hooked
+std::unique_ptr<ns::dac_8bit_r2r_device> g_left_dac;
+std::unique_ptr<ns::dac_8bit_r2r_device> g_right_dac;
+
+// the speaker's samples not yet taken, as MAME sums them, and the runtime's mix of the run in hand and the
+// values where it gave another
+std::vector<int16_t> g_mix_samples;
+int16_t g_runtime_mix[2 * NGP_T6W28_MAX_RUN];
+uint64_t g_mix_unlike = 0;
+
 // ---- the T6W28 ----
 
 class t6w28_chip : public ns::t6w28_device
@@ -203,11 +221,28 @@ public:
 			g_dac_right.push_back(g_dac_right_value);
 		}
 
+		// The speaker's samples: the DACs' levels over the run (each the same until its next write, which
+		// comes after a catch_up), and 0.50 of each T6W28 output with 0.25 of its side's DAC, as MAME sums
+		// them, exact in floats, taken down to a whole number with 1.0 as 32768
+		g_left_dac->generate(count);
+		g_right_dac->generate(count);
+		for (int index = 0; index < count; index++)
+		{
+			const float left = 0.50f * stream().m_outputs[0][size_t(index)]
+				+ 0.25f * g_left_dac->stream().m_outputs[0][size_t(index)];
+			const float right = 0.50f * stream().m_outputs[1][size_t(index)]
+				+ 0.25f * g_right_dac->stream().m_outputs[0][size_t(index)];
+			g_mix_samples.push_back(int16_t(std::floor(left * 32768.0f)));
+			g_mix_samples.push_back(int16_t(std::floor(right * 32768.0f)));
+		}
+
 		// The runtime's chip makes the same run, each value compared as MAME's stream holds it (put_int's
-		// value / 32768); a run longer than it takes counts as unlike, every value of it
+		// value / 32768), and the runtime's mix of it with the DACs' bytes is compared with MAME's sums; a run
+		// longer than the chip takes counts as unlike, every value of it
 		if (count > NGP_T6W28_MAX_RUN)
 		{
 			g_runtime_unlike += uint64_t(count) * 2;
+			g_mix_unlike += uint64_t(count) * 2;
 			return;
 		}
 		ngp_t6w28_generate(&g_runtime_t6w28, unsigned(count), g_runtime_samples);
@@ -215,6 +250,11 @@ public:
 			for (int output = 0; output < 2; output++)
 				if (stream().m_outputs[output][size_t(index)] != float(g_runtime_samples[index * 2 + output]) * (1.0f / 32768.0f))
 					g_runtime_unlike++;
+		ngp_mix(g_runtime_samples, unsigned(count), g_dac_left_value, g_dac_right_value, g_runtime_mix);
+		const size_t first = g_mix_samples.size() - size_t(count) * 2;
+		for (size_t index = 0; index < size_t(count) * 2; index++)
+			if (g_runtime_mix[index] != g_mix_samples[first + index])
+				g_mix_unlike++;
 	}
 	void write(unsigned offset, uint8_t data)
 	{
@@ -334,6 +374,13 @@ extern "C" void ns_attach(uint64_t time, uint8_t *shared_ram, const ns_host *hos
 	g_t6w28->reset();
 	g_t6w28->set_enable(false);
 
+	g_left_dac = std::make_unique<ns::dac_8bit_r2r_device>(g_config, "ldac", nullptr, 0);
+	g_right_dac = std::make_unique<ns::dac_8bit_r2r_device>(g_config, "rdac", nullptr, 0);
+	g_left_dac->start();
+	g_right_dac->start();
+	g_mix_samples.clear();
+	g_mix_unlike = 0;
+
 	g_time = time;
 	g_running = false;
 	g_slice_start = 0;
@@ -402,9 +449,15 @@ extern "C" void ns_dac_write(uint64_t time, int left, uint8_t data)
 	run_to(time);
 	g_t6w28->catch_up(time);
 	if (left)
+	{
 		g_dac_left_value = data;
+		g_left_dac->write(data);
+	}
 	else
+	{
 		g_dac_right_value = data;
+		g_right_dac->write(data);
+	}
 }
 
 extern "C" void ns_end_frame(uint64_t time)
@@ -425,18 +478,9 @@ extern "C" void ns_end_frame(uint64_t time)
 	}
 	g_frame_samples_hash = hash;
 
-	// the mix: left = 0.50 * output 0 + 0.25 * left DAC, right = 0.50 * output 1 + 0.25 * right DAC
-	// a DAC's level is its byte / 255.0 (an approximation of MAME's DAC_8BIT_R2R)
-	g_mix.clear();
-	for (size_t index = 0; index < sample_count; index++)
-	{
-		const float left_dac = float(g_dac_left[index]) / 255.0f;
-		const float right_dac = float(g_dac_right[index]) / 255.0f;
-		const float left = 0.50f * t6w28[index * 2] + 0.25f * left_dac;
-		const float right = 0.50f * t6w28[index * 2 + 1] + 0.25f * right_dac;
-		g_mix.push_back(int16_t(std::clamp(int(left * 32768.0f), -32768, 32767)));
-		g_mix.push_back(int16_t(std::clamp(int(right * 32768.0f), -32768, 32767)));
-	}
+	// the speaker's samples of the same samples, as catch_up summed them
+	g_mix.assign(g_mix_samples.begin(), g_mix_samples.begin() + ptrdiff_t(sample_count * 2));
+	g_mix_samples.erase(g_mix_samples.begin(), g_mix_samples.begin() + ptrdiff_t(sample_count * 2));
 	g_dac_left.erase(g_dac_left.begin(), g_dac_left.begin() + ptrdiff_t(sample_count));
 	g_dac_right.erase(g_dac_right.begin(), g_dac_right.begin() + ptrdiff_t(sample_count));
 }
@@ -487,4 +531,9 @@ extern "C" uint16_t ns_z80_pc(void)
 extern "C" uint64_t ns_t6w28_unlike(void)
 {
 	return g_runtime_unlike;
+}
+
+extern "C" uint64_t ns_mix_unlike(void)
+{
+	return g_mix_unlike;
 }

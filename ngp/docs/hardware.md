@@ -40,6 +40,8 @@
 | `0xA2` (io 0x22) | DAC Right | Write: Writes to `m_rdac`. | `ngp.cpp:291-292` |
 | `0xA3` (io 0x23) | DAC Left | Write: Writes to `m_ldac`. | `ngp.cpp:294-295` |
 
+Both DACs are `DAC_8BIT_R2R` (`ngp.cpp:874-875`; `dac.h:237`: unsigned, 8 bits, gain 1.0). With nothing routed into them a DAC gives `-1 + byte / 256 * 2`: `80` is the middle, `00` the bottom (`dac.cpp:28-33, 77-78, 91, 113`), and it starts at `00` (`m_curval(0)`, `dac.cpp:72`; no device_reset). The speaker takes the T6W28's output 0 and `m_ldac` on the left, output 1 and `m_rdac` on the right, the T6W28 at 0.50 and each DAC at 0.25 (`ngp.cpp:868-875`); a T6W28 output is its value / 32768 (`t6w28.cpp` through `put_int`).
+
 **Real-Time Clock (RTC)**
 
 | Address | Offset | Function | Behavior | Source |
@@ -473,8 +475,8 @@ Addresses in the K2GE sections are offsets in the chip: the CPU sees them at 0x8
 
 ## What Sonic Pocket Adventure uses
 
-*   TMP95C061: timers 0 and 1 (TRUN 0x20, TREG0 0x22, T01MOD 0x24, TRDC 0x29), the watchdog (0x6E, 0x6F), the interrupt levels 0x70, 0x71, 0x73, 0x74, 0x79, 0x7A, and the micro DMA start vectors 0x7C-0x7F, which it only clears (with DMAC0-3, in SYS_PATCH): no micro DMA transfer.
-*   NGP I/O: the PSG (0xA0, 0xA1), the DACs (0xA2, 0xA3), the pad (0xB0), the power button (0xB1), the link (0xB2), sound enable (0xB8), the Z80 (0xB9, 0xBA, 0xBC).
+*   TMP95C061: timers 0 and 1 (TRUN 0x20, TREG0 0x22, T01MOD 0x24, TRDC 0x29), timer 2 for the SEGA voice (WAVE_OUT, given timer 2 by FadeToTitle: T23MOD 0x28, TREG2 0x26 = 6, its interrupt through the BIOS's vector table; the disassembly's DACTmSetupPtrs), the watchdog (0x6E, 0x6F), the interrupt levels 0x70, 0x71, 0x73, 0x74, 0x79, 0x7A, and the micro DMA start vectors 0x7C-0x7F, which it only clears (with DMAC0-3, in SYS_PATCH): no micro DMA transfer.
+*   NGP I/O: the PSG (0xA0, 0xA1), the DACs (0xA2, 0xA3: only the SEGA voice, the same byte to both with one word write, 8080 as its rest; the disassembly calls 0xA2 `DAC_Left`, which ngp.cpp writes to `m_rdac`), the pad (0xB0), the power button (0xB1), the link (0xB2), sound enable (0xB8), the Z80 (0xB9, 0xBA, 0xBC).
 *   Video: window, the scroll of both planes and of the sprites, the priority register, colour and mono palettes, the background colour, the sprite table and its palettes, both tile maps, the character RAM.
 *   Flash: BIOS call VECT_FLASHWRITE, and its own command sequences (AA/55 at 5555/2AAA, F0 reset) at 3F21xx.
 *   BIOS calls (SWI 1): VECT_SHUTDOWN, VECT_CLOCKGEARSET, VECT_RTCGET, VECT_FLASHWRITE, and debug call 0F0h.

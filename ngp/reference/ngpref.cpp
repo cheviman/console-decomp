@@ -1326,6 +1326,7 @@ int main(int argc, char **argv)
 		std::cout << " (the first: " << g_runtime_first_register_unlike << ')';
 	std::cout << '\n'
 		<< "runtime T6W28 sample values unlike MAME's: " << ns_t6w28_unlike() << '\n'
+		<< "runtime mix values unlike MAME's: " << ns_mix_unlike() << '\n'
 		<< "runtime TMP95C061 unlike MAME's: " << g_cpu_reads_unlike << " reads, " << g_cpu_states_unlike
 		<< " states, " << g_cpu_irqs_unlike << " interrupt checks, " << g_cpu_dma_unlike << " micro DMA checks, "
 		<< g_cpu_registers_unlike << " frames' registers";
