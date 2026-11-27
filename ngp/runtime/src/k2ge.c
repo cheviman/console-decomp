@@ -1,6 +1,7 @@
 /**
  *    Name:        k2ge.c
- *    Description: the Neo Geo Pocket Color's video chip (K2GE) in C, a line at a time: ngp/k2ge.h
+ *    Description: the Neo Geo Pocket Color's video chip (K2GE) in C, a line at a time, its registers and its
+ *                 lines' timing: ngp/k2ge.h
  *    Version:     0.1.0
  *    Created:     27-11-2026
  *    Modified:    27-11-2026
@@ -8,7 +9,8 @@
  *
  *    license:BSD-3-Clause
  *    MAME 0.289's k1ge.cpp drawing translated to C: the chip's memory is read in place, no allocation,
- *    and a line is drawn on its own, as the console's time reaches it.
+ *    and a line is drawn on its own, as the console's time reaches it. Then its registers (k2ge_device::write,
+ *    k1ge_device::read, device_reset) and the start of a line (timer_callback), on the same memory.
  */
 #include "ngp/k2ge.h"
 
@@ -250,4 +252,188 @@ uint32_t ngp_k2ge_rgb(uint16_t colour)
 	uint32_t const g = ((colour >> 4) & 0x000f) * 17;
 	uint32_t const b = ((colour >> 8) & 0x000f) * 17;
 	return (r << 16) | (g << 8) | b;
+}
+
+/* ---- the registers and the timing ---- */
+
+/* k2ge_device::write and the k1ge_device::write it calls in its default case, without the palette calls:
+   the memory is read and written in place. The write to 000 makes the VBLANK call, as MAME's write does. */
+int ngp_k2ge_write(uint8_t *k2ge, unsigned offset, uint8_t data)
+{
+	offset &= 0x3FFF;
+	int vblank = NGP_K2GE_NO_CALL;
+
+	if (offset == 0x7E2)
+	{
+		/* MAME's lock: the write is lost while 7F0 is not AA */
+		if (k2ge[0x7F0] != 0xAA)
+		{
+			return NGP_K2GE_NO_CALL;
+		}
+		data &= 0x80;
+		k2ge[offset] = data;
+		return NGP_K2GE_NO_CALL;
+	}
+
+	if (offset >= 0x100 && offset <= 0x117)
+	{
+		data &= 0x07;
+		k2ge[offset] = data;
+		return NGP_K2GE_NO_CALL;
+	}
+
+	/* 012 and 118 are stored as they are, as MAME's k2ge_device::write does */
+	if (offset == 0x012 || offset == 0x118)
+	{
+		k2ge[offset] = data;
+		return NGP_K2GE_NO_CALL;
+	}
+
+	/* Every other offset goes through k1ge_device::write's switch on a copy of the data */
+	{
+		uint8_t k1ge_data = data;
+
+		switch (offset)
+		{
+		case 0x000:
+			vblank = (data & 0x80) ? (k2ge[0x010] & 0x40 ? 1 : 0) : 0;
+			break;
+		case 0x030:
+			/* MAME's k1ge_device::write keeps only bit 7, then k2ge_device::write stores the byte again whole */
+			k1ge_data &= 0x80;
+			break;
+		default:
+			break;
+		}
+
+		k2ge[offset] = k1ge_data;
+	}
+
+	/* k2ge_device::write goes on with its own data, unmasked: the high bytes of the palettes keep 4 bits */
+	if (offset >= 0x0200 && offset < 0x0400 && (offset & 1))
+	{
+		data &= 0x0F;
+	}
+
+	k2ge[offset] = data;
+
+	return vblank;
+}
+
+/* k1ge_device::read: the memory, but 008 (RAS.H) is the dot over 4 and 009 (RAS.V) is the line */
+uint8_t ngp_k2ge_read(const uint8_t *k2ge, unsigned offset, unsigned line, unsigned dot)
+{
+	offset &= 0x3FFF;
+
+	switch (offset)
+	{
+	case 0x008:
+		return (uint8_t)(dot >> 2);
+	case 0x009:
+		return (uint8_t)line;
+	default:
+		return k2ge[offset];
+	}
+}
+
+/* device_reset: the memory zeroed, then MAME's writes through ngp_k2ge_write. Returns the VBLANK call of the
+   write to 000 (0, as the data is 0) */
+int ngp_k2ge_reset(uint8_t *k2ge)
+{
+	static const uint16_t reset_table[] =
+	{
+		0x0000, 0x00, /* Interrupt enable */
+		0x0002, 0x00, /* WBA.H */
+		0x0003, 0x00, /* WBA.V */
+		0x0004, 0xFF, /* WSI.H */
+		0x0005, 0xFF, /* WSI.V */
+		0x0007, 0xC6, /* REF */
+		0x0012, 0x00, /* 2D control */
+		0x0020, 0x00, /* PO.H */
+		0x0021, 0x00, /* PO.V */
+		0x0030, 0x00, /* PF */
+		0x0032, 0x00, /* S1SO.H */
+		0x0033, 0x00, /* S1SO.V */
+		0x0034, 0x00, /* S2SO.H */
+		0x0035, 0x00, /* S2SO.V */
+		0x0101, 0x07, /* SPPLT01 */
+		0x0102, 0x07, /* SPPLT02 */
+		0x0103, 0x07, /* SPPLT03 */
+		0x0105, 0x07, /* SPPLT11 */
+		0x0106, 0x07, /* SPPLT12 */
+		0x0107, 0x07, /* SPPLT13 */
+		0x0109, 0x07, /* SC1PLT01 */
+		0x010A, 0x07, /* SC1PLT02 */
+		0x010B, 0x07, /* SC1PLT03 */
+		0x010D, 0x07, /* SC1PLT11 */
+		0x010E, 0x07, /* SC1PLT12 */
+		0x010F, 0x07, /* SC1PLT13 */
+		0x0111, 0x07, /* SC2PLT01 */
+		0x0112, 0x07, /* SC2PLT02 */
+		0x0113, 0x07, /* SC2PLT03 */
+		0x0115, 0x07, /* SC2PLT11 */
+		0x0116, 0x07, /* SC2PLT12 */
+		0x0117, 0x07, /* SC2PLT13 */
+		0x0118, 0x07, /* BG */
+		0x0400, 0xFF, /* LED control */
+		0x0402, 0x80, /* LEDFREG */
+		0x07E0, 0x52, /* RESET */
+		0x07E2, 0x00, /* MODE */
+	};
+	unsigned i;
+	int vblank = NGP_K2GE_NO_CALL;
+
+	for (i = 0; i < NGP_K2GE_SIZE; i++)
+	{
+		k2ge[i] = 0;
+	}
+
+	for (i = 0; i < sizeof reset_table / sizeof reset_table[0]; i += 2)
+	{
+		int result = ngp_k2ge_write(k2ge, reset_table[i], (uint8_t)reset_table[i + 1]);
+		if (reset_table[i] == 0x000)
+		{
+			vblank = result;
+		}
+	}
+
+	return vblank;
+}
+
+/* timer_callback with y = line, without its draw and without rescheduling: the window is taken at the start
+   of line 0, the VBLANK status is set or cleared, and the calls are made as MAME's devcb calls them */
+void ngp_k2ge_line_start(uint8_t *k2ge, unsigned line, ngp_k2ge_window *window, ngp_k2ge_calls *calls)
+{
+	calls->vblank = NGP_K2GE_NO_CALL;
+	calls->hblank = NGP_K2GE_NO_CALL;
+	calls->hblank_off = 0;
+
+	if (line >= 152)
+	{
+		k2ge[0x010] |= 0x40;
+		if (k2ge[0x000] & 0x80)
+		{
+			calls->vblank = 1;
+		}
+	}
+
+	if (line == 0)
+	{
+		ngp_k2ge_take_window(k2ge, window);
+		k2ge[0x010] &= (uint8_t)~0x40;
+		if (k2ge[0x000] & 0x80)
+		{
+			calls->vblank = 0;
+		}
+	}
+
+	/* MAME's hblank_on_timer is adjusted on these lines whether or not HBLANK was raised */
+	if (line == NGP_K2GE_LINES - 1 || line < 151)
+	{
+		if (k2ge[0x000] & 0x40)
+		{
+			calls->hblank = 1;
+		}
+		calls->hblank_off = 1;
+	}
 }

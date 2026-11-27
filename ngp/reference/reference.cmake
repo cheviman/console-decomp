@@ -1,8 +1,9 @@
 # Name:        reference.cmake
 # Description: builds the reference tools of a Neo Geo Pocket Color game on MAME's cores: ngpref (the original
 #              program and the console's BIOS on MAME's TMP95C061, with MAME's Z80, T6W28 and K2GE),
-#              test_k2ge (the runtime's K2GE against MAME's), test_flash (the board's flash against MAME's),
-#              test_ngpsound (the sound side) and test_t6w28 (the runtime's T6W28 against MAME's)
+#              test_k2ge and test_k2ge_registers (the runtime's K2GE against MAME's), test_flash (the
+#              board's flash against MAME's), test_ngpsound (the sound side) and test_t6w28 (the runtime's
+#              T6W28 against MAME's)
 # Version:     0.1.0
 # Created:     26-11-2026
 # Modified:    27-11-2026
@@ -87,6 +88,14 @@ add_executable(test_k2ge ${NGP_REFERENCE}/video/test_k2ge.cpp)
 target_link_libraries(test_k2ge PRIVATE ngp_video_reference ngp_runtime)
 if(MSVC)
 	target_compile_options(test_k2ge PRIVATE ${NGP_MSVC_WARNINGS})
+endif()
+
+# The check of the runtime's K2GE registers and lines' timing against MAME's, on random writes, reads and times
+# (video/test_k2ge_registers.cpp)
+add_executable(test_k2ge_registers ${NGP_REFERENCE}/video/test_k2ge_registers.cpp)
+target_link_libraries(test_k2ge_registers PRIVATE ngp_video_reference ngp_runtime)
+if(MSVC)
+	target_compile_options(test_k2ge_registers PRIVATE ${NGP_MSVC_WARNINGS})
 endif()
 
 # The check of the board's flash (ngp/machine.h) against MAME's flash_w (flash.hxx), on random command

@@ -36,8 +36,11 @@
  *
  *    Beside MAME's K2GE, the runtime's (ngp/k2ge.h) takes the window and draws every line when MAME's does,
  *    from the same memory; at the end of every frame their pens are compared, and the run ends saying how
- *    many lines differed. The runtime's T6W28 (ngp/t6w28.h) runs beside MAME's in the sound side
- *    (ngpsound.cpp), and the run ends saying how many of its sample values differed.
+ *    many lines differed. Its registers and timing keep their own 16 KB, which the CPU's writes reach as they
+ *    reach MAME's: every read is compared with MAME's, and at the end of every frame the memories and the calls
+ *    of the VBLANK and HBLANK lines; the runtime's lines are drawn from that memory. The runtime's T6W28
+ *    (ngp/t6w28.h) runs beside MAME's in the sound side (ngpsound.cpp), and the run ends saying how many of its
+ *    sample values differed.
  */
 #include "emu.h"
 #include "tmp95c061.h"
@@ -271,14 +274,92 @@ void power_nmi(int asserted)
 
 // ---- the lines between the chips ----
 
+// A call of one of the K2GE's lines: when, and the state it was called with. MAME's calls and the runtime's
+// are kept apart and compared at the end of every frame
+struct line_call
+{
+	uint64_t time;
+	int state;
+	bool operator==(const line_call &other) const { return time == other.time && state == other.state; }
+};
+std::vector<line_call> g_mame_vblank, g_mame_hblank, g_runtime_vblank, g_runtime_hblank;
+
 void vblank_pin(int state)
 {
+	g_mame_vblank.push_back({ now(), state });
 	g_cpu->set_input_line(TLCS900_INT4, state ? ASSERT_LINE : CLEAR_LINE);
 }
 
 void hblank_pin(int state)
 {
+	g_mame_hblank.push_back({ now(), state });
 	g_cpu->set_input_line(TLCS900_TIO, state ? ASSERT_LINE : CLEAR_LINE);
+}
+
+// The runtime's K2GE registers (ngp/k2ge.h) beside MAME's: its own 16 KB, which every write of the CPU reaches
+// as it reaches MAME's; every read is compared with MAME's, and the memories and the lines' calls at the end of
+// every frame
+uint8_t g_runtime_k2ge[NGP_K2GE_SIZE];
+uint64_t g_runtime_reads_unlike = 0, g_runtime_memory_unlike = 0, g_runtime_calls_unlike = 0;
+std::string g_runtime_first_register_unlike;
+
+void note_register_unlike(uint64_t &count, const std::string &what)
+{
+	if (!count++ && g_runtime_first_register_unlike.empty())
+		g_runtime_first_register_unlike = what;
+}
+
+uint8_t k2ge_read(uint32_t offset)
+{
+	const uint8_t data = nv_read(offset);
+	const uint64_t time = now() % kFrame;
+	const uint8_t runtime = ngp_k2ge_read(g_runtime_k2ge, offset, unsigned(time / kLine), unsigned(time % kLine));
+	if (runtime != data)
+	{
+		char text[96];
+		std::snprintf(text, sizeof(text), "a read of %04X at %" PRIu64 ": MAME %02X, runtime %02X", unsigned(offset),
+			now(), data, runtime);
+		note_register_unlike(g_runtime_reads_unlike, text);
+	}
+	return data;
+}
+
+void k2ge_write(uint32_t offset, uint8_t data)
+{
+	nv_write(offset, data);
+	const int call = ngp_k2ge_write(g_runtime_k2ge, offset, data);
+	if (call != NGP_K2GE_NO_CALL)
+		g_runtime_vblank.push_back({ now(), call });
+}
+
+// The calls up to 'time' of a line, MAME's against the runtime's; those compared are dropped
+bool same_calls(std::vector<line_call> &mame, std::vector<line_call> &runtime, uint64_t time)
+{
+	auto due = [time](const line_call &call) { return call.time <= time; };
+	const auto mame_end = std::find_if_not(mame.begin(), mame.end(), due);
+	const auto runtime_end = std::find_if_not(runtime.begin(), runtime.end(), due);
+	const bool same = std::equal(mame.begin(), mame_end, runtime.begin(), runtime_end);
+	mame.erase(mame.begin(), mame_end);
+	runtime.erase(runtime.begin(), runtime_end);
+	return same;
+}
+
+void compare_runtime_registers(uint64_t frame, uint64_t time)
+{
+	if (std::memcmp(nv_memory(), g_runtime_k2ge, NGP_K2GE_SIZE))
+	{
+		size_t offset = 0;
+		while (nv_memory()[offset] == g_runtime_k2ge[offset])
+			offset++;
+		char text[96];
+		std::snprintf(text, sizeof(text), "the memory at the end of frame %" PRIu64 ", first at %04zX", frame, offset);
+		note_register_unlike(g_runtime_memory_unlike, text);
+	}
+	const bool vblank = same_calls(g_mame_vblank, g_runtime_vblank, time);
+	const bool hblank = same_calls(g_mame_hblank, g_runtime_hblank, time);
+	if (!vblank || !hblank)
+		note_register_unlike(g_runtime_calls_unlike, "the " + std::string(vblank ? "HBLANK" : "VBLANK")
+			+ " calls of frame " + std::to_string(frame));
 }
 
 void int5(int state)
@@ -393,8 +474,9 @@ void run_cpu_until(uint64_t time)
 }
 
 // Runs the console up to 'time': the TMP95C061 and the Z80 up to each event before it, and the event
-// The runtime's K2GE (ngp/k2ge.h) beside MAME's: it takes the window and draws each line when MAME's does, at
-// the start of the line after it, from the same memory; the frames' pens are compared when they end
+// The runtime's K2GE (ngp/k2ge.h) beside MAME's: at the start of every line, when MAME's timer_callback runs, it
+// starts the line on its own memory (the status, the window at line 0, the lines' calls) and draws the line
+// before it from that memory; the frames' pens are compared when they end
 ngp_k2ge_window g_window = {};
 std::vector<uint8_t> g_runtime_pens(size_t(NV_WIDTH) * NV_HEIGHT);
 uint64_t g_runtime_lines_unlike = 0;
@@ -403,10 +485,16 @@ std::string g_runtime_first_unlike;
 void runtime_line(uint64_t time)
 {
 	const unsigned line = unsigned((time % kFrame) / kLine);
-	if (line == 0)
-		ngp_k2ge_take_window(nv_memory(), &g_window);
-	else if (line <= NGP_K2GE_HEIGHT)
-		ngp_k2ge_draw_line(nv_memory(), &g_window, line - 1, &g_runtime_pens[size_t(line - 1) * NV_WIDTH]);
+	ngp_k2ge_calls calls;
+	ngp_k2ge_line_start(g_runtime_k2ge, line, &g_window, &calls);
+	if (calls.vblank != NGP_K2GE_NO_CALL)
+		g_runtime_vblank.push_back({ time, calls.vblank });
+	if (calls.hblank != NGP_K2GE_NO_CALL)
+		g_runtime_hblank.push_back({ time, calls.hblank });
+	if (calls.hblank_off)
+		g_runtime_hblank.push_back({ time + NGP_K2GE_HBLANK_OFF, 0 });
+	if (line >= 1 && line <= NGP_K2GE_HEIGHT)
+		ngp_k2ge_draw_line(g_runtime_k2ge, &g_window, line - 1, &g_runtime_pens[size_t(line - 1) * NV_WIDTH]);
 }
 
 void compare_runtime_picture(uint64_t frame)
@@ -799,8 +887,8 @@ int main(int argc, char **argv)
 	// What the board asks of the chips
 	ngp_board.hooks.internal_read = internal_read;
 	ngp_board.hooks.internal_write = internal_write;
-	ngp_board.hooks.k2ge_read = nv_read;
-	ngp_board.hooks.k2ge_write = nv_write;
+	ngp_board.hooks.k2ge_read = k2ge_read;
+	ngp_board.hooks.k2ge_write = k2ge_write;
 	ngp_board.hooks.psg_write = psg_write;
 	ngp_board.hooks.psg_enable = psg_enable;
 	ngp_board.hooks.dac_write = dac_write;
@@ -813,6 +901,9 @@ int main(int argc, char **argv)
 	static const ns_host sound_host = { ngp_comm_read, ngp_comm_write, int5 };
 	ns_attach(0, ngp_board.sound_ram, &sound_host);
 	nv_attach(now, vblank_pin, hblank_pin);
+	const int reset_call = ngp_k2ge_reset(g_runtime_k2ge);
+	if (reset_call != NGP_K2GE_NO_CALL)
+		g_runtime_vblank.push_back({ now(), reset_call });
 
 	// MAME's machine_reset (TO3 low: ngp_power_on): the CPU from its reset vector, or the BIOS's restart when the
 	// NVRAM was loaded
@@ -841,6 +932,7 @@ int main(int argc, char **argv)
 		ngp_set_controls(g_controls);
 		ns_end_frame(time);
 		compare_runtime_picture(frame);
+		compare_runtime_registers(frame, time);
 		if (sound_hashes.is_open())
 		{
 			char text[64];
@@ -911,6 +1003,11 @@ int main(int argc, char **argv)
 		<< "runtime K2GE lines unlike MAME's: " << g_runtime_lines_unlike;
 	if (g_runtime_lines_unlike)
 		std::cout << " (the first in " << g_runtime_first_unlike << ')';
+	std::cout << '\n'
+		<< "runtime K2GE registers unlike MAME's: " << g_runtime_reads_unlike << " reads, "
+		<< g_runtime_memory_unlike << " frames' memory, " << g_runtime_calls_unlike << " frames' line calls";
+	if (!g_runtime_first_register_unlike.empty())
+		std::cout << " (the first: " << g_runtime_first_register_unlike << ')';
 	std::cout << '\n'
 		<< "runtime T6W28 sample values unlike MAME's: " << ns_t6w28_unlike() << '\n';
 	if (!trace_path.empty())
