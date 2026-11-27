@@ -1,0 +1,75 @@
+# Name:        reference.cmake
+# Description: builds the reference tools of a Neo Geo Pocket Color game on MAME's cores: ngpref (the original
+#              program and the console's BIOS on MAME's TMP95C061, with MAME's Z80, T6W28 and K2GE)
+# Version:     0.1.0
+# Created:     26-11-2026
+# Modified:    26-11-2026
+# Author:      Sebastian Toyos
+#
+# The game's CMakeLists.txt includes it when its reference tools are on, after runtime.cmake and its own data
+# library, and after it has found Python3::Interpreter, and sets:
+#   NGP_GAME_DATA     the game's library that reads its cartridge and the BIOS (game/extract.h, game/data.h)
+#   NGP_ARCADE_CORE   arcade-decomp (the game's tools/core: MAME's Z80 core and the sound chips' stand-in for
+#                     MAME's emu.h), which this builds on
+# MAME's sources here are MAME 0.289's (mame/ and ../../tlcs900/mame, BSD-3-Clause); the Z80 core is
+# arcade-decomp's copy.
+
+set(NGP_REFERENCE ${CMAKE_CURRENT_LIST_DIR})
+set(NGP_TLCS900 ${NGP_REFERENCE}/../../tlcs900)
+if(NOT NGP_ARCADE_CORE)
+	set(NGP_ARCADE_CORE ${CMAKE_SOURCE_DIR}/tools/core)
+endif()
+set(NGP_KONAMI_REFERENCE ${NGP_ARCADE_CORE}/konami/reference)
+set(NGP_SYSTEM32_REFERENCE ${NGP_ARCADE_CORE}/system32/reference)
+set(NGP_MSVC_WARNINGS /wd4244 /wd4267 /wd4100 /wd4146 /wd4127 /wd4018)
+
+# MAME's TLCS-900/H core, its TMP95C061 and its disassembler, on tlcs900/stub's stand-in for MAME's emu.h
+add_library(ngp_tlcs900_reference STATIC
+	${NGP_TLCS900}/mame/tlcs900.cpp
+	${NGP_TLCS900}/mame/tmp95c061.cpp
+	${NGP_TLCS900}/mame/dasm900.cpp
+)
+target_include_directories(ngp_tlcs900_reference PUBLIC ${NGP_TLCS900}/stub ${NGP_TLCS900}/mame)
+target_compile_features(ngp_tlcs900_reference PUBLIC cxx_std_20)
+if(MSVC)
+	target_compile_options(ngp_tlcs900_reference PRIVATE /bigobj ${NGP_MSVC_WARNINGS})
+endif()
+
+# The sound side: MAME's Z80 (system32/reference's copy of the core) and T6W28, and the two DACs. The Z80
+# core's steps are written from z80.lst at build time, as MAME does
+set(NGP_Z80 ${NGP_SYSTEM32_REFERENCE}/mame/z80)
+set(NGP_Z80_STEPS ${CMAKE_BINARY_DIR}/generated/cpu/z80/z80.hxx)
+add_custom_command(OUTPUT ${NGP_Z80_STEPS}
+	COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/generated/cpu/z80
+	COMMAND Python3::Interpreter ${NGP_Z80}/z80make.py z80 ${NGP_Z80}/z80.lst ${NGP_Z80_STEPS}
+	DEPENDS ${NGP_Z80}/z80make.py ${NGP_Z80}/z80.lst
+	VERBATIM)
+add_library(ngp_sound_reference STATIC
+	${NGP_REFERENCE}/sound/ngpsound.cpp
+	${NGP_Z80_STEPS}
+)
+target_include_directories(ngp_sound_reference
+	PUBLIC ${NGP_REFERENCE}/sound
+	PRIVATE ${NGP_KONAMI_REFERENCE}/sound ${NGP_Z80} ${CMAKE_BINARY_DIR}/generated ${NGP_REFERENCE}/mame)
+target_compile_features(ngp_sound_reference PUBLIC cxx_std_20)
+if(MSVC)
+	target_compile_options(ngp_sound_reference PRIVATE /bigobj ${NGP_MSVC_WARNINGS})
+endif()
+
+# The video side: MAME's K2GE on video/stub's stand-in for MAME's emu.h
+add_library(ngp_video_reference STATIC ${NGP_REFERENCE}/video/k2gevideo.cpp)
+target_include_directories(ngp_video_reference
+	PUBLIC ${NGP_REFERENCE}/video
+	PRIVATE ${NGP_REFERENCE}/video/stub ${NGP_REFERENCE}/mame)
+target_compile_features(ngp_video_reference PUBLIC cxx_std_20)
+if(MSVC)
+	target_compile_options(ngp_video_reference PRIVATE ${NGP_MSVC_WARNINGS})
+endif()
+
+# ngpref
+add_executable(ngpref ${NGP_REFERENCE}/ngpref.cpp)
+target_link_libraries(ngpref PRIVATE ngp_tlcs900_reference ngp_sound_reference ngp_video_reference ngp_runtime
+	${NGP_GAME_DATA})
+if(MSVC)
+	target_compile_options(ngpref PRIVATE ${NGP_MSVC_WARNINGS})
+endif()

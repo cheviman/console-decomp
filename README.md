@@ -39,6 +39,24 @@ submodules), and says which console it is. Nothing here is a game's: no ROM, no 
   - `docs/`: what the model is built on, where each figure comes from (Sega's manuals and bulletins, MAME,
     BlastEm), and what the manuals say that the model does not do (`references.md`).
 
+- `ngp/`: the SNK Neo Geo Pocket Color (the colour console, with a cartridge of up to 2 MB: flash chip 0).
+  - `runtime/`: for now what the console's tools share: the control scripts the tests run (`ngp/script.h`:
+    the pad, Option and the power button, and pokes of the RAM), and the reader of the player's cartridge
+    and BIOS (`ngp_cartridge`, the Mega Drive's reader). The console's model in C comes next.
+  - `reference/`: `ngpref`, the original program and the console's BIOS on MAME's TMP95C061 (`tlcs900/`),
+    with MAME's Z80, T6W28 and the two DACs (`sound/ngpsound.cpp`) and MAME's K2GE
+    (`video/k2gevideo.cpp`), wired as MAME's ngp.cpp wires them, without MAME's device framework: each on a
+    stand-in for MAME's emu.h of its own. Time is the master clock (6.144 MHz, a dot of the screen), and the
+    TMP95C061 and the Z80 run up to each of the console's events, as MAME's scheduler runs them. What MAME
+    takes from the computer it runs on is fixed, so that runs repeat: the clock's date (`--rtc`) and the
+    NVRAM (`--nvram`, `--save-nvram`: MAME's ngpc.nv). Per frame: hashes of the state, the picture and the
+    sound; over a run: the code executed (`--trace`), every instruction disassembled (`--log`), dumps of the
+    memories, the picture as BMP and the sound as WAV. `mame/` holds MAME 0.289's ngp.cpp, K1GE/K2GE and
+    T6W28, as the description of the console; `flash.hxx` is ngp.cpp's flash commands as they are.
+  - `docs/hardware.md`: the console as MAME 0.289 describes it, every fact cited to its file and line.
+- `tlcs900/`: the Toshiba TLCS-900/H: MAME 0.289's core, its TMP95C061 and its disassembler (`mame/`), and the
+  stand-in for MAME's emu.h they build on unchanged (`stub/`).
+
 The material read for reference (Sega's manuals, BlastEm's source, the GEMS research) lives in `external/`,
 which git ignores: it is read, never committed.
 
@@ -55,6 +73,13 @@ which git ignores: it is read, never committed.
 - [ ] The timing checked against Nemesis's measures of the VDP's slots, against BlastEm running the same
       input, and against the console
 - [ ] The VDP's shadow and highlight, interlace, the window plane's corner cases, six-button pads, PAL
+- [x] Neo Geo Pocket Color: `ngpref` boots the real BIOS (a console never set up turns itself off until its
+      power button, then asks for its first setup) and a cartridge (Sonic the Hedgehog Pocket Adventure) to its
+      title and its first zone, with the same hashes run after run
+- [ ] `ngpref --jumps` and `--rom-reads`: MAME's TLCS-900 core fetches its instructions through the same reads
+      as its data, which have to be told apart first
+- [ ] The Neo Geo Pocket Color's model in C (memory, the TMP95C061's timers and interrupts, the K2GE a line at a
+      time, the T6W28 and the DACs, the flash, the pad) and its BIOS in C, checked against `ngpref`
 
 ## Using it from a game
 
@@ -65,6 +90,12 @@ cartridge (`game_rom_set_load` in `game/extract.h`, `game_program` in `game/data
 source of its own, in `MD_GAME_DATA` too), and with a translated program in its build folder it calls
 `md_translated_program(NAME GENERATED LIBRARIES...)`, which builds `NAME_headless`. The build needs Python 3 (MAME's 68000 and Z80 cores are written at
 build time by MAME's own scripts) and a C++20 compiler.
+
+A Neo Geo Pocket Color game does the same with `ngp/`: its `CMakeLists.txt` includes
+`ngp/runtime/runtime.cmake`, makes a library that reads its cartridge and the BIOS (`game_rom_set_load` and
+`game_bios_load` in `game/extract.h`, `game_program` and `game_bios` in `game/data.h`, through
+`md_cartridge_load`, linked with `ngp_cartridge`), sets `NGP_GAME_DATA` to it and `NGP_ARCADE_CORE` to its
+arcade-decomp, and includes `ngp/reference/reference.cmake`, which builds `ngpref`.
 
 ## Legal
 
