@@ -44,6 +44,10 @@ void nv_fire(uint64_t time, uint64_t *present);
    is now */
 void nv_picture(uint8_t *rgb);
 
+/* The picture as drawn so far as MAME's pens: 160 x 152, a line after another (the runtime's K2GE draws the
+   same pens, ngp/k2ge.h) */
+void nv_pens(uint16_t *pens);
+
 /* The chip's memory (16 KB), for the state's hash */
 const uint8_t *nv_memory(void);
 

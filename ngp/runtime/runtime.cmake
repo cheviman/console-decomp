@@ -1,17 +1,17 @@
 # Name:        runtime.cmake
-# Description: builds the Neo Geo Pocket Color's runtime: what the console's tools share (ngp_runtime: the
-#              controls scripts), and the reader of the player's cartridge (ngp_cartridge, for the tools that
-#              run the original code)
+# Description: builds the Neo Geo Pocket Color's runtime: the console's model and what its tools share
+#              (ngp_runtime: the K2GE, the controls scripts), and the reader of the player's cartridge
+#              (ngp_cartridge, for the tools that run the original code)
 # Version:     0.1.0
 # Created:     26-11-2026
-# Modified:    26-11-2026
+# Modified:    27-11-2026
 # Author:      Sebastian Toyos
 #
 # A game's CMakeLists.txt includes it and links ngp_runtime (and, for its reference tools, ngp_cartridge).
 
 set(NGP_RUNTIME ${CMAKE_CURRENT_LIST_DIR})
 
-add_library(ngp_runtime STATIC ${NGP_RUNTIME}/src/script.c)
+add_library(ngp_runtime STATIC ${NGP_RUNTIME}/src/script.c ${NGP_RUNTIME}/src/k2ge.c)
 target_include_directories(ngp_runtime PUBLIC ${NGP_RUNTIME}/include)
 
 # The reader of the player's cartridge is the Mega Drive's (md/cartridge.h: a ROM file, a .zip holding it or

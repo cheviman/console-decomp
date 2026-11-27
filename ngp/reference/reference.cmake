@@ -1,9 +1,10 @@
 # Name:        reference.cmake
 # Description: builds the reference tools of a Neo Geo Pocket Color game on MAME's cores: ngpref (the original
-#              program and the console's BIOS on MAME's TMP95C061, with MAME's Z80, T6W28 and K2GE)
+#              program and the console's BIOS on MAME's TMP95C061, with MAME's Z80, T6W28 and K2GE) and
+#              test_k2ge (the runtime's K2GE against MAME's)
 # Version:     0.1.0
 # Created:     26-11-2026
-# Modified:    26-11-2026
+# Modified:    27-11-2026
 # Author:      Sebastian Toyos
 #
 # The game's CMakeLists.txt includes it when its reference tools are on, after runtime.cmake and its own data
@@ -64,6 +65,13 @@ target_include_directories(ngp_video_reference
 target_compile_features(ngp_video_reference PUBLIC cxx_std_20)
 if(MSVC)
 	target_compile_options(ngp_video_reference PRIVATE ${NGP_MSVC_WARNINGS})
+endif()
+
+# The check of the runtime's K2GE against MAME's, on dumps of the chip's memory (video/test_k2ge.cpp)
+add_executable(test_k2ge ${NGP_REFERENCE}/video/test_k2ge.cpp)
+target_link_libraries(test_k2ge PRIVATE ngp_video_reference ngp_runtime)
+if(MSVC)
+	target_compile_options(test_k2ge PRIVATE ${NGP_MSVC_WARNINGS})
 endif()
 
 # ngpref

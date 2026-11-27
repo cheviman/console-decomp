@@ -94,6 +94,14 @@ void nv_picture(uint8_t *rgb)
 		}
 }
 
+void nv_pens(uint16_t *pens)
+{
+	const nv::bitmap_ind16 &bitmap = g_video->bitmap();
+	for (int y = 0; y < NV_HEIGHT; y++)
+		for (int x = 0; x < NV_WIDTH; x++)
+			pens[size_t(y) * NV_WIDTH + size_t(x)] = bitmap.pix(y, x);
+}
+
 const uint8_t *nv_memory(void)
 {
 	return g_video->memory();

@@ -30,6 +30,10 @@
  *    the instruction that read them, as "PC FIRST-LAST" ranges (mdref's and kref's format, which arcade-decomp's
  *    coverage.py reads). The core reads its instructions through the same space as its data: its RDOP marks
  *    them (tlcs900.cpp's one change), and they are left out.
+ *
+ *    Beside MAME's K2GE, the runtime's (ngp/k2ge.h) takes the window and draws every line when MAME's does,
+ *    from the same memory; at the end of every frame their pens are compared, and the run ends saying how
+ *    many lines differed.
  */
 #include "emu.h"
 #include "tmp95c061.h"
@@ -39,6 +43,7 @@
 #include "ngp/script.h"
 #include "ngpsound.h"
 #include "k2gevideo.h"
+#include "ngp/k2ge.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -539,15 +544,49 @@ void run_cpu_until(uint64_t time)
 }
 
 // Runs the console up to 'time': the TMP95C061 and the Z80 up to each event before it, and the event
+// The runtime's K2GE (ngp/k2ge.h) beside MAME's: it takes the window and draws each line when MAME's does, at
+// the start of the line after it, from the same memory; the frames' pens are compared when they end
+ngp_k2ge_window g_window = {};
+std::vector<uint8_t> g_runtime_pens(size_t(NV_WIDTH) * NV_HEIGHT);
+uint64_t g_runtime_lines_unlike = 0;
+std::string g_runtime_first_unlike;
+
+void runtime_line(uint64_t time)
+{
+	const unsigned line = unsigned((time % kFrame) / kLine);
+	if (line == 0)
+		ngp_k2ge_take_window(nv_memory(), &g_window);
+	else if (line <= NGP_K2GE_HEIGHT)
+		ngp_k2ge_draw_line(nv_memory(), &g_window, line - 1, &g_runtime_pens[size_t(line - 1) * NV_WIDTH]);
+}
+
+void compare_runtime_picture(uint64_t frame)
+{
+	std::vector<uint16_t> pens(size_t(NV_WIDTH) * NV_HEIGHT);
+	nv_pens(pens.data());
+	for (unsigned line = 0; line < NV_HEIGHT; line++)
+		for (unsigned x = 0; x < NV_WIDTH; x++)
+			if (pens[line * NV_WIDTH + x] != g_runtime_pens[line * NV_WIDTH + x])
+			{
+				if (!g_runtime_lines_unlike++)
+					g_runtime_first_unlike = "frame " + std::to_string(frame) + ", line " + std::to_string(line)
+						+ ", x " + std::to_string(x);
+				break;
+			}
+}
+
 void run_until(uint64_t time)
 {
 	for (;;)
 	{
 		const uint64_t next = std::min({ nv_next_event(), g_next_second, time });
+		const bool line_starts = nv_next_event() == next && next % kLine == 0;
 		run_cpu_until(next);
 		ns_run_until(next);
 		g_in_event = true;
 		nv_fire(next, &g_event_time);
+		if (line_starts)
+			runtime_line(next);
 		if (g_next_second <= next)
 		{
 			g_event_time = g_next_second;
@@ -954,6 +993,7 @@ int main(int argc, char **argv)
 			power_changed(pressed);
 		}
 		ns_end_frame(time);
+		compare_runtime_picture(frame);
 		if (sound_hashes.is_open())
 		{
 			char text[64];
@@ -1019,7 +1059,11 @@ int main(int argc, char **argv)
 		<< "unique addresses:  " << unique << '\n'
 		<< "final PC:          " << std::hex << cpu.pc() << std::dec << '\n'
 		<< "flash writes:      " << g_flash_writes << '\n'
-		<< "Z80 cycles:        " << ns_z80_cycles() << '\n';
+		<< "Z80 cycles:        " << ns_z80_cycles() << '\n'
+		<< "runtime K2GE lines unlike MAME's: " << g_runtime_lines_unlike;
+	if (g_runtime_lines_unlike)
+		std::cout << " (the first in " << g_runtime_first_unlike << ')';
+	std::cout << '\n';
 	if (!trace_path.empty())
 		write_addresses(trace_path, g_executed, 1u << 24, 6, "TMP95C061 addresses executed by ngpref");
 	if (!jumps_path.empty())
