@@ -50,12 +50,14 @@ submodules), and says which console it is. Nothing here is a game's: no ROM, no 
     TMP95C061 and the Z80 run up to each of the console's events, as MAME's scheduler runs them. What MAME
     takes from the computer it runs on is fixed, so that runs repeat: the clock's date (`--rtc`) and the
     NVRAM (`--nvram`, `--save-nvram`: MAME's ngpc.nv). Per frame: hashes of the state, the picture and the
-    sound; over a run: the code executed (`--trace`), every instruction disassembled (`--log`), dumps of the
-    memories, the picture as BMP and the sound as WAV. `mame/` holds MAME 0.289's ngp.cpp, K1GE/K2GE and
+    sound; over a run: the code executed (`--trace`), where each JP or CALL through a register went
+    (`--jumps`), the cartridge's bytes read as data (`--rom-reads`), every instruction disassembled (`--log`),
+    dumps of the memories, the picture as BMP and the sound as WAV. `mame/` holds MAME 0.289's ngp.cpp, K1GE/K2GE and
     T6W28, as the description of the console; `flash.hxx` is ngp.cpp's flash commands as they are.
   - `docs/hardware.md`: the console as MAME 0.289 describes it, every fact cited to its file and line.
 - `tlcs900/`: the Toshiba TLCS-900/H: MAME 0.289's core, its TMP95C061 and its disassembler (`mame/`), and the
-  stand-in for MAME's emu.h they build on unchanged (`stub/`).
+  stand-in for MAME's emu.h they build on (`stub/`), unchanged but for one thing: the core's RDOP marks its
+  instruction fetches, which go through the same space as its data (said in tlcs900.cpp's header).
 
 The material read for reference (Sega's manuals, BlastEm's source, the GEMS research) lives in `external/`,
 which git ignores: it is read, never committed.
@@ -76,8 +78,8 @@ which git ignores: it is read, never committed.
 - [x] Neo Geo Pocket Color: `ngpref` boots the real BIOS (a console never set up turns itself off until its
       power button, then asks for its first setup) and a cartridge (Sonic the Hedgehog Pocket Adventure) to its
       title and its first zone, with the same hashes run after run
-- [ ] `ngpref --jumps` and `--rom-reads`: MAME's TLCS-900 core fetches its instructions through the same reads
-      as its data, which have to be told apart first
+- [x] `ngpref --jumps` and `--rom-reads`: MAME's TLCS-900 core fetches its instructions through the same reads
+      as its data; its RDOP now marks them
 - [ ] The Neo Geo Pocket Color's model in C (memory, the TMP95C061's timers and interrupts, the K2GE a line at a
       time, the T6W28 and the DACs, the flash, the pad) and its BIOS in C, checked against `ngpref`
 

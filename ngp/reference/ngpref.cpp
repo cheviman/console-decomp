@@ -4,7 +4,7 @@
  *                 MAME's cores (TMP95C061, Z80, T6W28, K2GE), frame by frame from a controls script
  *    Version:     0.1.0
  *    Created:     26-11-2026
- *    Modified:    26-11-2026
+ *    Modified:    27-11-2026
  *    Author:      Sebastian Toyos
  *
  *    license:BSD-3-Clause
@@ -24,6 +24,12 @@
  *    What MAME takes from the computer it runs on is fixed here, so that two runs are the same: the clock
  *    starts at --rtc's date, and the NVRAM (the work RAM and the first 32 I/O bytes, as MAME's ngpc.nv) is the
  *    file --nvram names, or none (the BIOS then starts as a console that has never been set up).
+ *
+ *    Over a run: --trace writes the addresses executed; --jumps where each JP or CALL through a register
+ *    went when it was taken ("FROM TO"); --rom-reads the cartridge's bytes the TMP95C061 reads as data, under
+ *    the instruction that read them, as "PC FIRST-LAST" ranges (mdref's and kref's format, which arcade-decomp's
+ *    coverage.py reads). The core reads its instructions through the same space as its data: its RDOP marks
+ *    them (tlcs900.cpp's one change), and they are left out.
  */
 #include "emu.h"
 #include "tmp95c061.h"
@@ -47,6 +53,8 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace
@@ -101,6 +109,10 @@ public:
 	explicit reference_cpu(const machine_config &config) : tmp95c061_device(config, "maincpu", nullptr, uint32_t(kClock)) {}
 
 	uint32_t pc() const { return m_pc.d; }
+	uint32_t sp() const { return m_xssp.d; }
+
+	// Whether the core is reading its instruction stream (RDOP), not data
+	bool fetching() const { return m_fetching; }
 
 	// Where MAME's ngp.cpp starts the BIOS when the NVRAM was loaded (machine_reset: set_state_int(TLCS900_PC))
 	void set_pc(uint32_t address)
@@ -109,8 +121,9 @@ public:
 		m_prefetch_clear = true;
 	}
 
-	// The instruction at 'pc', as MAME's dasm900 writes it, read from the bus without side effects
-	std::string disassemble(uint32_t pc, uint8_t (*read)(offs_t))
+	// The instruction at 'pc', as MAME's dasm900 writes it, read from the bus without side effects; its length
+	// in bytes goes to 'length' when one is given
+	std::string disassemble(uint32_t pc, uint8_t (*read)(offs_t), uint32_t *length = nullptr)
 	{
 		if (!m_disassembler)
 			m_disassembler = create_disassembler();
@@ -121,7 +134,9 @@ public:
 		g_machine.m_side_effects_disabled = false;
 		const util::disasm_interface::data_buffer bytes(window, 31);
 		std::ostringstream text;
-		m_disassembler->disassemble(text, pc, bytes, bytes);
+		const offs_t result = m_disassembler->disassemble(text, pc, bytes, bytes);
+		if (length)
+			*length = result & util::disasm_interface::LENGTHMASK;
 		return text.str();
 	}
 
@@ -276,6 +291,18 @@ void io_w(offs_t offset, uint8_t data)
 
 std::vector<uint8_t> g_executed(size_t(1) << 21, 0);  // 16 MB of addresses, a bit each
 uint64_t g_instructions = 0;
+uint32_t g_instruction_pc = 0;        // the instruction running: the last one the hook saw begin
+
+// --rom-reads: (instruction, address) pairs of the cartridge's bytes the TMP95C061 reads as data; not its
+// instruction fetches (RDOP marks them) nor the reference's own reads (the disassembler's, the stack's)
+std::set<uint64_t> g_rom_reads;
+bool g_record_rom_reads = false;
+
+void record_rom_read(offs_t address)
+{
+	if (g_record_rom_reads && !g_cpu->fetching() && !g_machine.m_side_effects_disabled)
+		g_rom_reads.insert(uint64_t(g_instruction_pc) << 24 | address);
+}
 
 uint8_t bus_r8(offs_t address)
 {
@@ -294,9 +321,15 @@ uint8_t bus_r8(offs_t address)
 	if (address >= 0x8000 && address < 0xc000)
 		return nv_read(address - 0x8000);
 	if (address >= 0x200000 && address < 0x400000)
+	{
+		record_rom_read(address);
 		return g_cartridge[address - 0x200000];
+	}
 	if (address >= 0x800000 && address < 0xa00000)
+	{
+		record_rom_read(address);
 		return g_cartridge[address - 0x800000 + 0x200000];
+	}
 	if (address >= 0xff0000)
 		return game_bios[address - 0xff0000];
 	return 0;
@@ -414,11 +447,76 @@ std::ofstream g_log;                  // --log: every instruction of the frames 
 uint64_t g_log_first = 0, g_log_last = 0;
 uint64_t g_frame = 0;
 
+// --jumps: where each JP or CALL through a register went, when it was taken. Those are the ones whose
+// memory operand is a register's (the prefixes B0-BF and F3-F5: (r), (r+d8), (r+d16), (r+r8), (r+r16),
+// (-r), (r+)); with an address in it (F0-F2) the target is in the instruction.
+std::set<std::pair<uint32_t, uint32_t>> g_jumps;
+bool g_record_jumps = false;
+
+struct pending_jump
+{
+	bool waiting = false;
+	uint32_t from = 0;        // the jump's address
+	uint32_t next = 0;        // the instruction after it, where it goes when it is not taken
+	uint32_t sp = 0;          // XSP before it
+};
+pending_jump g_pending_jump;
+
+// By address, in the cartridge and the BIOS (RAM's code can change): a JP or CALL through a register's
+// length, or 0 for any other instruction
+std::unordered_map<uint32_t, uint32_t> g_jump_lengths;
+
+uint32_t computed_jump_length(uint32_t pc)
+{
+	g_machine.m_side_effects_disabled = true;
+	const uint8_t first = bus_r8(pc);
+	g_machine.m_side_effects_disabled = false;
+	if ((first < 0xb0 || first > 0xbf) && (first < 0xf3 || first > 0xf5))
+		return 0;
+	const bool lasting = pc >= 0x200000;
+	if (lasting)
+	{
+		const auto found = g_jump_lengths.find(pc);
+		if (found != g_jump_lengths.end())
+			return found->second;
+	}
+	uint32_t length = 0;
+	const std::string text = g_cpu->disassemble(pc, bus_r8, &length);
+	if (text.rfind("jp ", 0) != 0 && text.rfind("call ", 0) != 0)
+		length = 0;
+	if (lasting)
+		g_jump_lengths[pc] = length;
+	return length;
+}
+
+// The jump waiting has ended at 'pc'. An interrupt taken between the two pushed the PC and SR (6 bytes, on
+// top of the 4 a CALL pushes; tmp95c061.cpp's tlcs900_check_irqs) and 'pc' is its handler's: the PC it
+// pushed is where the jump went.
+void end_jump(uint32_t pc)
+{
+	g_pending_jump.waiting = false;
+	const uint32_t sp = g_cpu->sp();
+	uint32_t to = pc;
+	if (int64_t(g_pending_jump.sp) - int64_t(sp) >= 6)
+	{
+		g_machine.m_side_effects_disabled = true;
+		to = bus_r32(sp + 2) & 0xffffff;
+		g_machine.m_side_effects_disabled = false;	}
+	if (to != g_pending_jump.next)
+		g_jumps.emplace(g_pending_jump.from, to);
+}
+
 void on_instruction(offs_t pc)
 {
 	pc &= 0xffffff;
 	g_executed[pc >> 3] |= uint8_t(1u << (pc & 7));
 	g_instructions++;
+	g_instruction_pc = pc;
+	if (g_pending_jump.waiting)
+		end_jump(pc);
+	if (g_record_jumps)
+		if (const uint32_t length = computed_jump_length(pc))
+			g_pending_jump = { true, pc, (pc + length) & 0xffffff, g_cpu->sp() };
 	if (g_log.is_open() && g_frame >= g_log_first && g_frame <= g_log_last)
 	{
 		char text[48];
@@ -560,6 +658,48 @@ void write_addresses(const std::string &path, const std::vector<uint8_t> &bits, 
 		}
 }
 
+// The reads as "PC FIRST-LAST" lines: by instruction, runs of consecutive bytes (mdref's write_reads)
+void write_reads(const std::string &path, const std::set<uint64_t> &reads, const char *title)
+{
+	std::ofstream out(path);
+	out << "# " << title << ": PC FIRST-LAST\n";
+	uint32_t pc = 0, first = 0, last = 0;
+	bool open = false;
+	auto flush = [&]() {
+		char text[40];
+		std::snprintf(text, sizeof(text), "%06X %06X-%06X\n", pc, first, last);
+		out << text;
+	};
+	for (const uint64_t pair : reads)
+	{
+		const uint32_t here_pc = uint32_t(pair >> 24), here = uint32_t(pair & 0xffffff);
+		if (open && here_pc == pc && here == last + 1)
+		{
+			last = here;
+			continue;
+		}
+		if (open)
+			flush();
+		pc = here_pc;
+		first = last = here;
+		open = true;
+	}
+	if (open)
+		flush();
+}
+
+void write_jumps(const std::string &path)
+{
+	std::ofstream out(path);
+	out << "# where each TMP95C061 JP or CALL through a register went, by ngpref: FROM TO\n";
+	for (const auto &jump : g_jumps)
+	{
+		char text[24];
+		std::snprintf(text, sizeof(text), "%06X %06X\n", jump.first, jump.second);
+		out << text;
+	}
+}
+
 // The console's memories at the end of a frame, a file each: DIR/FRAME_main_ram.bin...
 void dump_frame(const std::string &folder, uint64_t frame)
 {
@@ -622,12 +762,13 @@ int main(int argc, char **argv)
 {
 	const char *usage =
 		"usage: ngpref [--frames N] [--script FILE] [--rom FOLDER] [--bios FOLDER] [--nvram FILE] [--save-nvram FILE]"
-		" [--rtc YYYYMMDDhhmmss] [--hashes FILE] [--trace FILE] [--dump FRAME ... --dump-dir DIR]"
+		" [--rtc YYYYMMDDhhmmss] [--hashes FILE] [--trace FILE] [--jumps FILE] [--rom-reads FILE]"
+		" [--dump FRAME ... --dump-dir DIR]"
 		" [--video-hashes FILE] [--video-dump FRAME ... --video-dir DIR] [--sound-hashes FILE] [--sound-wav FILE]"
 		" [--sound-trace FILE] [--log FILE [--log-frames FIRST LAST]]\n";
 	std::string rom_folder = "rom", bios_folder, nvram_path, save_nvram_path, script_path;
 	std::string hashes_path, trace_path, dump_folder = ".", video_hashes_path, video_folder = ".";
-	std::string sound_hashes_path, sound_wav_path, sound_trace_path, log_path;
+	std::string sound_hashes_path, sound_wav_path, sound_trace_path, log_path, jumps_path, rom_reads_path;
 	std::set<uint64_t> dump_frames, video_dump_frames;
 	uint64_t frames = 600;
 	bool frames_given = false;
@@ -667,6 +808,10 @@ int main(int argc, char **argv)
 			hashes_path = argv[++index];
 		else if (option == "--trace" && has_value)
 			trace_path = argv[++index];
+		else if (option == "--jumps" && has_value)
+			jumps_path = argv[++index];
+		else if (option == "--rom-reads" && has_value)
+			rom_reads_path = argv[++index];
 		else if (option == "--dump")
 			frame_list(dump_frames);
 		else if (option == "--dump-dir" && has_value)
@@ -698,6 +843,8 @@ int main(int argc, char **argv)
 	}
 	if (bios_folder.empty())
 		bios_folder = rom_folder;
+	g_record_jumps = !jumps_path.empty();
+	g_record_rom_reads = !rom_reads_path.empty();
 
 	if (const char *problem = game_rom_set_load(rom_folder.c_str()))
 	{
@@ -875,6 +1022,10 @@ int main(int argc, char **argv)
 		<< "Z80 cycles:        " << ns_z80_cycles() << '\n';
 	if (!trace_path.empty())
 		write_addresses(trace_path, g_executed, 1u << 24, 6, "TMP95C061 addresses executed by ngpref");
+	if (!jumps_path.empty())
+		write_jumps(jumps_path);
+	if (!rom_reads_path.empty())
+		write_reads(rom_reads_path, g_rom_reads, "cartridge bytes the TMP95C061 read as data, by ngpref");
 	if (!sound_wav_path.empty())
 		write_wav(sound_wav_path, sound_mix, ns_mix_rate());
 	if (!sound_trace_path.empty())

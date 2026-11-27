@@ -8,6 +8,11 @@ TODO:
 - implement the remaining internal mcu features (serial transfer, etc)
 - add support for 900 minimum and normal modes
 
+console-decomp's one change (27-11-2026): RDOP sets m_fetching while it
+reads the instruction stream, so that a host can tell the core's
+instruction fetches from its data reads, which both go through the
+program space; nothing else of MAME 0.289's file is changed.
+
 *******************************************************************/
 
 #include "emu.h"
@@ -82,6 +87,7 @@ inline uint8_t tlcs900_device::RDOP()
 {
 	uint8_t data;
 
+	m_fetching = true;
 	if ( m_prefetch_clear )
 	{
 		for ( int i = 0; i < 4; i++ )
@@ -96,6 +102,7 @@ inline uint8_t tlcs900_device::RDOP()
 		m_prefetch[ m_prefetch_index ] = RDMEM( m_pc.d + 3 );
 		m_prefetch_index = ( m_prefetch_index + 1 ) & 0x03;
 	}
+	m_fetching = false;
 	data = m_prefetch[ m_prefetch_index ];
 	m_pc.d++;
 	return data;
