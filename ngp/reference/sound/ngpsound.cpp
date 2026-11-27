@@ -4,7 +4,7 @@
  *                 DACs, on the console's time (ngpsound.h)
  *    Version:     0.1.0
  *    Created:     26-11-2026
- *    Modified:    26-11-2026
+ *    Modified:    27-11-2026
  *    Author:      Sebastian Toyos
  *
  *    license:BSD-3-Clause
@@ -26,8 +26,12 @@
  *    device_start leaves port 1's registers (m_register[8..15]) as the memory had them: the chips are built
  *    in zeroed memory, so that they start at 0 and a run does not depend on the one before it.
  *    test_ngpsound.cpp is the check.
+ *
+ *    Beside MAME's T6W28, the runtime's (ngp/t6w28.h) takes the same writes and makes the same runs of
+ *    samples, and every value is compared with MAME's (ns_t6w28_unlike).
  */
 #include "ngpsound.h"
+#include "ngp/t6w28.h"
 
 #include <algorithm>
 #include <bit>
@@ -159,6 +163,11 @@ std::vector<uint8_t> g_dac_right;
 uint8_t g_dac_left_value = 0;
 uint8_t g_dac_right_value = 0;
 
+// the runtime's T6W28, its samples of the run in hand, and the values where it gave another sample than MAME's
+ngp_t6w28 g_runtime_t6w28;
+int16_t g_runtime_samples[2 * NGP_T6W28_MAX_RUN];
+uint64_t g_runtime_unlike = 0;
+
 // ---- the T6W28 ----
 
 class t6w28_chip : public ns::t6w28_device
@@ -193,11 +202,30 @@ public:
 			g_dac_left.push_back(g_dac_left_value);
 			g_dac_right.push_back(g_dac_right_value);
 		}
+
+		// The runtime's chip makes the same run, each value compared as MAME's stream holds it (put_int's
+		// value / 32768); a run longer than it takes counts as unlike, every value of it
+		if (count > NGP_T6W28_MAX_RUN)
+		{
+			g_runtime_unlike += uint64_t(count) * 2;
+			return;
+		}
+		ngp_t6w28_generate(&g_runtime_t6w28, unsigned(count), g_runtime_samples);
+		for (int index = 0; index < count; index++)
+			for (int output = 0; output < 2; output++)
+				if (stream().m_outputs[output][size_t(index)] != float(g_runtime_samples[index * 2 + output]) * (1.0f / 32768.0f))
+					g_runtime_unlike++;
 	}
 	void write(unsigned offset, uint8_t data)
 	{
 		catch_up(now());
 		ns::t6w28_device::write(offset, data);
+		ngp_t6w28_write(&g_runtime_t6w28, offset, data);
+	}
+	void set_enable(bool enable)
+	{
+		ns::t6w28_device::set_enable(enable);
+		ngp_t6w28_set_enable(&g_runtime_t6w28, enable ? 1 : 0);
 	}
 };
 
@@ -300,6 +328,8 @@ extern "C" void ns_attach(uint64_t time, uint8_t *shared_ram, const ns_host *hos
 	g_z80->reset();
 
 	g_t6w28 = std::make_unique<t6w28_chip>(g_config);
+	ngp_t6w28_reset(&g_runtime_t6w28);
+	g_runtime_unlike = 0;
 	g_t6w28->start();
 	g_t6w28->reset();
 	g_t6w28->set_enable(false);
@@ -452,4 +482,9 @@ extern "C" const uint8_t *ns_executed(void)
 extern "C" uint16_t ns_z80_pc(void)
 {
 	return g_z80_pc;
+}
+
+extern "C" uint64_t ns_t6w28_unlike(void)
+{
+	return g_runtime_unlike;
 }

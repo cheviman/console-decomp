@@ -4,7 +4,7 @@
  *                 DACs, on the console's time
  *    Version:     0.1.0
  *    Created:     26-11-2026
- *    Modified:    26-11-2026
+ *    Modified:    27-11-2026
  *    Author:      Sebastian Toyos
  *
  *    license:BSD-3-Clause
@@ -76,6 +76,10 @@ const uint8_t *ns_executed(void);
 
 /* The address of the Z80's instruction running now */
 uint16_t ns_z80_pc(void);
+
+/* The runtime's T6W28 (ngp/t6w28.h), run beside MAME's with the same writes and the same runs of samples: the
+   values (two a sample) where it gave another than MAME's since ns_attach */
+uint64_t ns_t6w28_unlike(void);
 
 #ifdef __cplusplus
 }

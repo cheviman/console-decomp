@@ -36,7 +36,8 @@
  *
  *    Beside MAME's K2GE, the runtime's (ngp/k2ge.h) takes the window and draws every line when MAME's does,
  *    from the same memory; at the end of every frame their pens are compared, and the run ends saying how
- *    many lines differed.
+ *    many lines differed. The runtime's T6W28 (ngp/t6w28.h) runs beside MAME's in the sound side
+ *    (ngpsound.cpp), and the run ends saying how many of its sample values differed.
  */
 #include "emu.h"
 #include "tmp95c061.h"
@@ -910,7 +911,8 @@ int main(int argc, char **argv)
 		<< "runtime K2GE lines unlike MAME's: " << g_runtime_lines_unlike;
 	if (g_runtime_lines_unlike)
 		std::cout << " (the first in " << g_runtime_first_unlike << ')';
-	std::cout << '\n';
+	std::cout << '\n'
+		<< "runtime T6W28 sample values unlike MAME's: " << ns_t6w28_unlike() << '\n';
 	if (!trace_path.empty())
 		write_addresses(trace_path, g_executed, 1u << 24, 6, "TMP95C061 addresses executed by ngpref");
 	if (!jumps_path.empty())
