@@ -1,7 +1,8 @@
 // license:BSD-3-Clause
 // copyright-holders:Wilbert Pol
 // MAME 0.289's ngp.cpp, lines 335-544: ngp_state::flash_w, the cartridge's flash commands, as they are.
-// ngpref.cpp includes it after its ngp_state, which keeps the names it uses (m_flash_chip, F_READ...).
+// test_flash.cpp includes it after its ngp_state, which keeps the names it uses (m_flash_chip, F_READ...), to
+// check the runtime's board (ngp/machine.h) against it.
 
 template <int Which> void ngp_state::flash_w(offs_t offset, uint8_t data)
 {

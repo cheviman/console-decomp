@@ -40,15 +40,18 @@ submodules), and says which console it is. Nothing here is a game's: no ROM, no 
     BlastEm), and what the manuals say that the model does not do (`references.md`).
 
 - `ngp/`: the SNK Neo Geo Pocket Color (the colour console, with a cartridge of up to 2 MB: flash chip 0).
-  - `runtime/`: the console's model in C, as far as it goes: the K2GE (`ngp/k2ge.h`: a line at a time from
-    the chip's 16 KB read in place, as MAME's pens, and a pen's colour as the registers and palettes give
-    it); and what the console's tools share: the control scripts the tests run (`ngp/script.h`: the pad,
-    Option and the power button, and pokes of the RAM), and the reader of the player's cartridge and BIOS
-    (`ngp_cartridge`, the Mega Drive's reader). The rest of the console's model comes next.
+  - `runtime/`: the console's model in C, as far as it goes: the board (`ngp/machine.h`: ngp.cpp's memory
+    map, I/O, clock, pad and power button, NVRAM and flash, with the cartridge read in place and the flash
+    the program writes kept in 32 KB of RAM; the processors, the K2GE and the sound side are the host's,
+    through hooks) and the K2GE (`ngp/k2ge.h`: a line at a time from the chip's 16 KB read in place, as
+    MAME's pens, and a pen's colour as the registers and palettes give it); and what the console's tools
+    share: the control scripts the tests run (`ngp/script.h`: the pad, Option and the power button, and
+    pokes of the RAM), and the reader of the player's cartridge and BIOS (`ngp_cartridge`, the Mega Drive's
+    reader). The rest of the console's model comes next.
   - `reference/`: `ngpref`, the original program and the console's BIOS on MAME's TMP95C061 (`tlcs900/`),
     with MAME's Z80, T6W28 and the two DACs (`sound/ngpsound.cpp`) and MAME's K2GE
     (`video/k2gevideo.cpp`), wired as MAME's ngp.cpp wires them, without MAME's device framework: each on a
-    stand-in for MAME's emu.h of its own. Time is the master clock (6.144 MHz, a dot of the screen), and the
+    stand-in for MAME's emu.h of its own, and all on the runtime's board. Time is the master clock (6.144 MHz, a dot of the screen), and the
     TMP95C061 and the Z80 run up to each of the console's events, as MAME's scheduler runs them. What MAME
     takes from the computer it runs on is fixed, so that runs repeat: the clock's date (`--rtc`) and the
     NVRAM (`--nvram`, `--save-nvram`: MAME's ngpc.nv). Per frame: hashes of the state, the picture and the
@@ -58,8 +61,9 @@ submodules), and says which console it is. Nothing here is a game's: no ROM, no 
     every line when MAME's does, and the run ends saying how many lines differed. `test_k2ge`
     (`video/test_k2ge.cpp`) checks the runtime's K2GE against MAME's on dumps of the chip's memory, each also
     with its planes swapped, in the K1GE-compatible mode, with a small window and with its sprites past the
-    right edge. `mame/` holds MAME 0.289's ngp.cpp, K1GE/K2GE and T6W28, as the description of the console;
-    `flash.hxx` is ngp.cpp's flash commands as they are.
+    right edge. `test_flash` runs the board's flash and MAME's (`flash.hxx`, ngp.cpp's flash commands as
+    they are) side by side on random command sequences, over cartridges of every size MAME takes. `mame/`
+    holds MAME 0.289's ngp.cpp, K1GE/K2GE and T6W28, as the description of the console.
   - `docs/hardware.md`: the console as MAME 0.289 describes it, every fact cited to its file and line.
 - `tlcs900/`: the Toshiba TLCS-900/H: MAME 0.289's core, its TMP95C061 and its disassembler (`mame/`), and the
   stand-in for MAME's emu.h they build on (`stub/`), unchanged but for one thing: the core's RDOP marks its
@@ -88,8 +92,10 @@ which git ignores: it is read, never committed.
       as its data; its RDOP now marks them
 - [x] The Neo Geo Pocket Color's K2GE in C, a line at a time: the same pens as MAME's in every line of
       `ngpref`'s runs
-- [ ] The rest of the Neo Geo Pocket Color's model in C (memory, the TMP95C061's timers and interrupts, the
-      T6W28 and the DACs, the flash, the pad) and its BIOS in C, checked against `ngpref`
+- [x] The Neo Geo Pocket Color's board in C (memory, I/O, clock, pad, flash, NVRAM): `ngpref` runs on it with
+      the same hashes, and its flash is MAME's on random command sequences
+- [ ] The rest of the Neo Geo Pocket Color's model in C (the K2GE's registers, the TMP95C061's timers and
+      interrupts, the T6W28 and the DACs) and its BIOS in C, checked against `ngpref`
 
 ## Using it from a game
 

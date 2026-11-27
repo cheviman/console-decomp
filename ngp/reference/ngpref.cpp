@@ -8,11 +8,14 @@
  *    Author:      Sebastian Toyos
  *
  *    license:BSD-3-Clause
- *    The console is MAME 0.289's ngp.cpp (mame/, BSD-3-Clause, Wilbert Pol) without MAME's device framework:
- *    its memory map, its I/O at 000080-0000BF, its real-time clock, its flash cartridge (flash.hxx, MAME's
- *    flash_w as it is) and the way it wires the chips: the TMP95C061 (tlcs900/mame) runs the BIOS and the
- *    game, the K2GE (video/k2gevideo) raises INT4 at VBLANK and pulses TI0 at every HBLANK, the Z80, the T6W28
- *    and the DACs are the sound side (sound/ngpsound), and timer 3's output (TO3, port A) raises the Z80's IRQ.
+ *    The console is the runtime's board (ngp/machine.h): MAME 0.289's ngp.cpp (mame/, BSD-3-Clause, Wilbert
+ *    Pol) in C, its memory map, its I/O at 000080-0000BF, its real-time clock and its flash cartridge, with
+ *    the cartridge read in place and its save area (game/data.h's GAME_SAVE_BASE) in the board's RAM. Here it
+ *    wires the chips as ngp.cpp does: the TMP95C061 (tlcs900/mame) runs the BIOS and the game and keeps its
+ *    own registers, the K2GE (video/k2gevideo) raises INT4 at VBLANK and pulses TI0 at every HBLANK, the Z80,
+ *    the T6W28 and the DACs are the sound side (sound/ngpsound), and timer 3's output (TO3, port A) raises the
+ *    Z80's IRQ. The run ends saying how many of the flash's programs and erases fell outside the save area,
+ *    where the board cannot keep them (MAME's flash would have).
  *
  *    Time is the master clock (6.144 MHz): a TMP95C061 cycle, a dot of the screen; a frame is 199 lines of
  *    515 dots. As MAME's scheduler does, the TMP95C061 runs up to the next event of the console (a line's
@@ -41,6 +44,7 @@
 #include "game/data.h"
 #include "game/extract.h"
 #include "ngp/script.h"
+#include "ngp/machine.h"
 #include "ngpsound.h"
 #include "k2gevideo.h"
 #include "ngp/k2ge.h"
@@ -65,46 +69,12 @@
 namespace
 {
 
-// MAME's ngp.cpp, lines 122-133: the flash's command states, as flash.hxx names them
-enum flash_state
-{
-	F_READ,                     /* xxxx F0 or 5555 AA 2AAA 55 5555 F0 */
-	F_PROG1,
-	F_PROG2,
-	F_COMMAND,
-	F_ID_READ,                  /* 5555 AA 2AAA 55 5555 90 */
-	F_AUTO_PROGRAM,             /* 5555 AA 2AAA 55 5555 A0 address data */
-	F_AUTO_CHIP_ERASE,          /* 5555 AA 2AAA 55 5555 80 5555 AA 2AAA 55 5555 10 */
-	F_AUTO_BLOCK_ERASE,         /* 5555 AA 2AAA 55 5555 80 5555 AA 2AAA 55 block_address 30 */
-	F_BLOCK_PROTECT             /* 5555 AA 2AAA 55 5555 9A 5555 AA 2AAA 55 5555 9A */
-};
-
-// What of MAME's ngp_state flash_w uses
-class ngp_state
-{
-public:
-	struct {
-		bool      present = false;
-		uint8_t   manufacturer_id = 0;
-		uint8_t   device_id = 0;
-		uint8_t   *data = nullptr;
-		uint8_t   org_data[16] = { };
-		int32_t   state = F_READ;
-		uint8_t   command[2] = { };
-	} m_flash_chip[2];
-
-	template <int Which> void flash_w(offs_t offset, uint8_t data);
-};
-
-#include "flash.hxx"
-
 // ---- the console's timing (MAME's ngp.cpp: 6.144 MHz, the screen's set_raw 515 x 199) ----
 
-constexpr uint64_t kClock = 6144000;
-constexpr uint64_t kLine = 515;
-constexpr uint64_t kFrame = kLine * 199;
-constexpr uint64_t kVblankLine = 152;
-constexpr uint64_t kCartridgeSpace = 0x400000;     // MAME's ngp.cpp allocates 4 MB for both flash chips
+constexpr uint64_t kClock = NGP_MASTER_CLOCK;
+constexpr uint64_t kLine = NGP_LINE_CLOCKS;
+constexpr uint64_t kFrame = NGP_FRAME_CLOCKS;
+constexpr uint64_t kVblankLine = NGP_VBLANK_LINE;
 
 // ---- the TMP95C061, with what the reference needs of it ----
 
@@ -152,15 +122,8 @@ private:
 machine_config g_config;
 reference_cpu *g_cpu = nullptr;
 
-// ---- the console's memories and I/O (MAME's ngp_state) ----
+// ---- the console (the runtime's board, ngp_board) ----
 
-uint8_t g_main_ram[0x3000];            // 004000-006FFF
-uint8_t g_sound_ram[0x1000];           // 007000-007FFF, the Z80's 0000-0FFF
-uint8_t g_io_reg[0x40];                // 000080-0000BF
-std::vector<uint8_t> g_cartridge(kCartridgeSpace, 0);
-ngp_state g_flash;
-uint64_t g_flash_writes = 0;
-uint8_t g_old_to3 = 0;
 uint8_t g_controls = 0;                // the script's: NGP_UP... and NGP_POWER
 
 // The internal registers' handlers, by address (000000-00007F)
@@ -184,24 +147,11 @@ uint64_t now()
 	return g_cpu_time;
 }
 
-// ---- the real-time clock (MAME's device_rtc_interface as ngp.cpp uses it) ----
+// ---- the real-time clock: the board keeps it, and a second passes every kClock ----
 
-struct rtc_clock
-{
-	int year = 2000, month = 1, day = 1, hour = 0, minute = 0, second = 0;
-} g_rtc;
 uint64_t g_next_second = kClock;
 
-uint8_t to_bcd(int value)
-{
-	return uint8_t(((value / 10) % 10) << 4 | (value % 10));
-}
-
-int from_bcd(uint8_t value)
-{
-	return (value >> 4) * 10 + (value & 0x0f);
-}
-
+// The days of a month, for --rtc's check (the board's clock counts them as MAME's device_rtc_interface does)
 int days_in_month(int month, int year)
 {
 	static const int days[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
@@ -209,90 +159,7 @@ int days_in_month(int month, int year)
 	return month == 2 && leap ? 29 : days[(month - 1) % 12];
 }
 
-void advance_second()
-{
-	if (++g_rtc.second < 60)
-		return;
-	g_rtc.second = 0;
-	if (++g_rtc.minute < 60)
-		return;
-	g_rtc.minute = 0;
-	if (++g_rtc.hour < 24)
-		return;
-	g_rtc.hour = 0;
-	if (++g_rtc.day <= days_in_month(g_rtc.month, g_rtc.year))
-		return;
-	g_rtc.day = 1;
-	if (++g_rtc.month <= 12)
-		return;
-	g_rtc.month = 1;
-	g_rtc.year++;
-}
-
-// ---- 000080-0000BF (MAME's ngp_state::io_r, io_w) ----
-
-uint8_t io_r(offs_t offset)
-{
-	uint8_t data = g_io_reg[offset];
-	switch (offset)
-	{
-	case 0x11: return to_bcd(g_rtc.year % 100);
-	case 0x12: return to_bcd(g_rtc.month);
-	case 0x13: return to_bcd(g_rtc.day);
-	case 0x14: return to_bcd(g_rtc.hour);
-	case 0x15: return to_bcd(g_rtc.minute);
-	case 0x16: return to_bcd(g_rtc.second);
-	case 0x30:                                          // the pad
-		return uint8_t(g_controls & 0x7f);
-	case 0x31:                                          // the power button, and the sub-battery always fine
-		data = (g_controls & NGP_POWER) ? 0x01 : 0x00;
-		data |= 0x02;
-		break;
-	}
-	return data;
-}
-
-void io_w(offs_t offset, uint8_t data)
-{
-	switch (offset)
-	{
-	case 0x11: g_rtc.year = from_bcd(data); break;
-	case 0x12: g_rtc.month = from_bcd(data); break;
-	case 0x13: g_rtc.day = from_bcd(data); break;
-	case 0x14: g_rtc.hour = from_bcd(data); break;
-	case 0x15: g_rtc.minute = from_bcd(data); break;
-	case 0x16: g_rtc.second = from_bcd(data); break;
-	case 0x20:                                          // the T6W28, "right" and "left": MAME writes both to port 0
-	case 0x21:
-		if (g_io_reg[0x38] == 0x55 && g_io_reg[0x39] == 0xAA)
-			ns_psg_write(now(), data);
-		break;
-	case 0x22:
-		ns_dac_write(now(), 0, data);
-		break;
-	case 0x23:
-		ns_dac_write(now(), 1, data);
-		break;
-	case 0x38:                                          // sound on (55) or off (AA)
-		if (data == 0x55)
-			ns_psg_enable(now(), 1);
-		else if (data == 0xAA)
-			ns_psg_enable(now(), 0);
-		break;
-	case 0x39:                                          // the Z80 on (55) or off (AA)
-		if (data == 0x55)
-			ns_z80_start(now());
-		else if (data == 0xAA)
-			ns_z80_stop(now());
-		break;
-	case 0x3a:
-		ns_z80_nmi(now());
-		break;
-	}
-	g_io_reg[offset] = data;
-}
-
-// ---- the TMP95C061's bus (MAME's ngp_state::main_mem; an 8-bit bus: set_am8_16(1)) ----
+// ---- the TMP95C061's bus: the board's map (MAME's ngp_state::main_mem; an 8-bit bus: set_am8_16(1)) ----
 
 std::vector<uint8_t> g_executed(size_t(1) << 21, 0);  // 16 MB of addresses, a bit each
 uint64_t g_instructions = 0;
@@ -303,7 +170,8 @@ uint32_t g_instruction_pc = 0;        // the instruction running: the last one t
 std::set<uint64_t> g_rom_reads;
 bool g_record_rom_reads = false;
 
-void record_rom_read(offs_t address)
+// The board's data_read hook: a byte of the cartridge read
+void record_rom_read(uint32_t address)
 {
 	if (g_record_rom_reads && !g_cpu->fetching() && !g_machine.m_side_effects_disabled)
 		g_rom_reads.insert(uint64_t(g_instruction_pc) << 24 | address);
@@ -311,62 +179,12 @@ void record_rom_read(offs_t address)
 
 uint8_t bus_r8(offs_t address)
 {
-	address &= 0xffffff;
-	if (address < 0x80)
-	{
-		const address_map::entry *entry = g_internal[address];
-		return entry && entry->read ? entry->read(address - entry->start) : 0;
-	}
-	if (address < 0xc0)
-		return io_r(address - 0x80);
-	if (address >= 0x4000 && address < 0x7000)
-		return g_main_ram[address - 0x4000];
-	if (address >= 0x7000 && address < 0x8000)
-		return g_sound_ram[address - 0x7000];
-	if (address >= 0x8000 && address < 0xc000)
-		return nv_read(address - 0x8000);
-	if (address >= 0x200000 && address < 0x400000)
-	{
-		record_rom_read(address);
-		return g_cartridge[address - 0x200000];
-	}
-	if (address >= 0x800000 && address < 0xa00000)
-	{
-		record_rom_read(address);
-		return g_cartridge[address - 0x800000 + 0x200000];
-	}
-	if (address >= 0xff0000)
-		return game_bios[address - 0xff0000];
-	return 0;
+	return ngp_read8(address);
 }
 
 void bus_w8(offs_t address, uint8_t data)
 {
-	address &= 0xffffff;
-	if (address < 0x80)
-	{
-		const address_map::entry *entry = g_internal[address];
-		if (entry && entry->write)
-			entry->write(address - entry->start, data);
-	}
-	else if (address < 0xc0)
-		io_w(address - 0x80, data);
-	else if (address >= 0x4000 && address < 0x7000)
-		g_main_ram[address - 0x4000] = data;
-	else if (address >= 0x7000 && address < 0x8000)
-		g_sound_ram[address - 0x7000] = data;
-	else if (address >= 0x8000 && address < 0xc000)
-		nv_write(address - 0x8000, data);
-	else if (address >= 0x200000 && address < 0x400000)
-	{
-		g_flash_writes++;
-		g_flash.flash_w<0>(address - 0x200000, data);
-	}
-	else if (address >= 0x800000 && address < 0xa00000)
-	{
-		g_flash_writes++;
-		g_flash.flash_w<1>(address - 0x800000, data);
-	}
+	ngp_write8(address, data);
 }
 
 // Words and longs on the 8-bit bus: their bytes in order, the lowest address first
@@ -394,6 +212,62 @@ void bus_w32(offs_t address, uint32_t data)
 	bus_w16(address + 2, uint16_t(data >> 16));
 }
 
+// ---- what the board asks of the chips (its hooks) ----
+
+// The TMP95C061's own registers (000000-00007F), through its internal map
+uint8_t internal_read(uint32_t address)
+{
+	const address_map::entry *entry = g_internal[address];
+	return entry && entry->read ? entry->read(address - entry->start) : 0;
+}
+
+void internal_write(uint32_t address, uint8_t data)
+{
+	const address_map::entry *entry = g_internal[address];
+	if (entry && entry->write)
+		entry->write(address - entry->start, data);
+}
+
+// The sound side, at the present
+void psg_write(uint8_t data)
+{
+	ns_psg_write(now(), data);
+}
+
+void psg_enable(int on)
+{
+	ns_psg_enable(now(), on);
+}
+
+void dac_write(unsigned which, uint8_t data)
+{
+	ns_dac_write(now(), int(which), data);
+}
+
+void z80_run(int run)
+{
+	if (run)
+		ns_z80_start(now());
+	else
+		ns_z80_stop(now());
+}
+
+void z80_nmi()
+{
+	ns_z80_nmi(now());
+}
+
+void z80_irq()
+{
+	ns_z80_irq(now());
+}
+
+// The power button's NMI, when the board lets it through (MAME's ngp_state::power_callback)
+void power_nmi(int asserted)
+{
+	g_cpu->set_input_line(TLCS900_NMI, asserted ? ASSERT_LINE : CLEAR_LINE);
+}
+
 // ---- the lines between the chips ----
 
 void vblank_pin(int state)
@@ -406,32 +280,6 @@ void hblank_pin(int state)
 	g_cpu->set_input_line(TLCS900_TIO, state ? ASSERT_LINE : CLEAR_LINE);
 }
 
-// Port A: TO3 rising raises the Z80's IRQ (MAME's ngp_state::tlcs900_porta)
-void port_a(uint8_t data)
-{
-	const uint8_t to3 = BIT(data, 3);
-	if (to3 && !g_old_to3)
-		ns_z80_irq(now());
-	g_old_to3 = to3;
-}
-
-// The power button: an NMI when the BIOS lets it (MAME's ngp_state::power_callback)
-void power_changed(bool pressed)
-{
-	if (BIT(g_io_reg[0x33], 2))
-		g_cpu->set_input_line(TLCS900_NMI, pressed ? CLEAR_LINE : ASSERT_LINE);
-}
-
-uint8_t comm_read()
-{
-	return g_io_reg[0x3c];
-}
-
-void comm_write(uint8_t data)
-{
-	g_io_reg[0x3c] = data;
-}
-
 void int5(int state)
 {
 	g_cpu->set_input_line(TLCS900_INT5, state ? ASSERT_LINE : CLEAR_LINE);
@@ -441,9 +289,9 @@ void script_poke(void *context, uint32_t address, uint8_t value)
 {
 	(void)context;
 	if (address >= 0x4000 && address < 0x7000)
-		g_main_ram[address - 0x4000] = value;
+		ngp_board.main_ram[address - 0x4000] = value;
 	else if (address >= 0x7000 && address < 0x8000)
-		g_sound_ram[address - 0x7000] = value;
+		ngp_board.sound_ram[address - 0x7000] = value;
 }
 
 // ---- running ----
@@ -590,7 +438,7 @@ void run_until(uint64_t time)
 		if (g_next_second <= next)
 		{
 			g_event_time = g_next_second;
-			advance_second();
+			ngp_clock_second();
 			g_next_second += kClock;
 		}
 		g_in_event = false;
@@ -609,7 +457,8 @@ uint64_t fnv(uint64_t hash, const void *data, size_t size)
 	return hash;
 }
 
-// The console's state: the TMP95C061's registers, its memories, the K2GE's, the I/O, the flash's save area
+// The console's state: the TMP95C061's registers, its memories, the K2GE's, the I/O, the game's save area
+// (the board's first 16 KB from GAME_SAVE_BASE; not the BIOS's bytes after it, as the hashes always were)
 uint64_t state_hash()
 {
 	static const int registers[] = { TLCS900_PC, TLCS900_SR, TLCS900_XWA0, TLCS900_XBC0, TLCS900_XDE0,
@@ -622,12 +471,12 @@ uint64_t state_hash()
 		const uint32_t value = g_cpu->state_value(index);
 		hash = fnv(hash, &value, sizeof(value));
 	}
-	hash = fnv(hash, g_main_ram, sizeof(g_main_ram));
-	hash = fnv(hash, g_sound_ram, sizeof(g_sound_ram));
-	hash = fnv(hash, g_io_reg, sizeof(g_io_reg));
+	hash = fnv(hash, ngp_board.main_ram, sizeof(ngp_board.main_ram));
+	hash = fnv(hash, ngp_board.sound_ram, sizeof(ngp_board.sound_ram));
+	hash = fnv(hash, ngp_board.io, sizeof(ngp_board.io));
 	hash = fnv(hash, nv_memory(), 0x4000);
-	hash = fnv(hash, &g_cartridge[0x1f8000], 0x4000);
-	hash = fnv(hash, &g_flash_writes, sizeof(g_flash_writes));
+	hash = fnv(hash, ngp_board.save, 0x4000);
+	hash = fnv(hash, &ngp_board.flash_writes, sizeof(ngp_board.flash_writes));
 	return hash;
 }
 
@@ -743,9 +592,9 @@ void write_jumps(const std::string &path)
 void dump_frame(const std::string &folder, uint64_t frame)
 {
 	const struct { const char *name; const void *data; size_t size; } memories[] = {
-		{ "main_ram", g_main_ram, sizeof(g_main_ram) },
-		{ "sound_ram", g_sound_ram, sizeof(g_sound_ram) },
-		{ "io", g_io_reg, sizeof(g_io_reg) },
+		{ "main_ram", ngp_board.main_ram, sizeof(ngp_board.main_ram) },
+		{ "sound_ram", ngp_board.sound_ram, sizeof(ngp_board.sound_ram) },
+		{ "io", ngp_board.io, sizeof(ngp_board.io) },
 		{ "k2ge", nv_memory(), 0x4000 },
 	};
 	for (const auto &memory : memories)
@@ -756,28 +605,28 @@ void dump_frame(const std::string &folder, uint64_t frame)
 }
 
 // MAME's ngpc.nv: the work RAM (004000-006FFF) and the first 32 I/O bytes (000080-00009F)
-constexpr size_t kNvramSize = 0x3000 + 0x20;
+constexpr size_t kNvramSize = NGP_NVRAM_SIZE;
 
 bool read_nvram(const std::string &path)
 {
 	std::ifstream in(path, std::ios::binary);
-	std::vector<char> data(kNvramSize);
-	if (!in.read(data.data(), std::streamsize(kNvramSize)))
+	std::vector<uint8_t> data(kNvramSize);
+	if (!in.read(reinterpret_cast<char *>(data.data()), std::streamsize(kNvramSize)))
 		return false;
-	std::memcpy(g_main_ram, data.data(), 0x3000);
-	std::memcpy(g_io_reg, data.data() + 0x3000, 0x20);
+	ngp_nvram_read(data.data());
 	return true;
 }
 
 void write_nvram(const std::string &path)
 {
+	std::vector<uint8_t> data(kNvramSize);
+	ngp_nvram_write(data.data());
 	std::ofstream out(path, std::ios::binary);
-	out.write(reinterpret_cast<const char *>(g_main_ram), 0x3000);
-	out.write(reinterpret_cast<const char *>(g_io_reg), 0x20);
+	out.write(reinterpret_cast<const char *>(data.data()), std::streamsize(kNvramSize));
 }
 
 // YYYYMMDDhhmmss
-bool parse_date(const char *text, rtc_clock &clock)
+bool parse_date(const char *text, ngp_clock &clock)
 {
 	if (std::strlen(text) != 14)
 		return false;
@@ -811,6 +660,7 @@ int main(int argc, char **argv)
 	std::set<uint64_t> dump_frames, video_dump_frames;
 	uint64_t frames = 600;
 	bool frames_given = false;
+	ngp_board.clock = { 2000, 1, 1, 0, 0, 0 };     // --rtc's, or MAME's own date when it has none
 
 	for (int index = 1; index < argc; index++)
 	{
@@ -837,7 +687,7 @@ int main(int argc, char **argv)
 			save_nvram_path = argv[++index];
 		else if (option == "--rtc" && has_value)
 		{
-			if (!parse_date(argv[++index], g_rtc))
+			if (!parse_date(argv[++index], ngp_board.clock))
 			{
 				std::cerr << "--rtc takes a date and time as YYYYMMDDhhmmss\n";
 				return 1;
@@ -896,24 +746,11 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	// The cartridge (MAME's load_ngp_cart and machine_start): a 2 MB one is flash chip 0, a Toshiba 16 Mbit
-	std::memcpy(g_cartridge.data(), game_program, GAME_PROGRAM_SIZE);
-	{
-		auto &chip = g_flash.m_flash_chip[0];
-		chip.present = true;
-		chip.manufacturer_id = 0x98;
-		chip.device_id = GAME_PROGRAM_SIZE <= 0x80000 ? 0xab : GAME_PROGRAM_SIZE == 0x100000 ? 0x2c : 0x2f;
-		chip.state = F_READ;
-		for (int chip_index = 0; chip_index < 2; chip_index++)
-		{
-			auto &each = g_flash.m_flash_chip[chip_index];
-			each.data = g_cartridge.data() + size_t(chip_index) * 0x200000;
-			const size_t places[4] = { 0, 0x7c000, 0xfc000, 0x1fc000 };
-			for (int place = 0; place < 4; place++)
-				for (int byte = 0; byte < 4; byte++)
-					each.org_data[place * 4 + byte] = each.data[places[place] + size_t(byte)];
-		}
-	}
+	// The cartridge in the board (MAME's load_ngp_cart and machine_start: a 2 MB one is flash chip 0, a Toshiba
+	// 16 Mbit), its save area in the board's RAM, and the BIOS
+	ngp_insert(game_program, GAME_PROGRAM_SIZE, GAME_SAVE_BASE);
+	ngp_board.bios = game_bios;
+	ngp_power_on();
 
 	const bool nvram_loaded = !nvram_path.empty();
 	if (nvram_loaded && !read_nvram(nvram_path))
@@ -936,6 +773,7 @@ int main(int argc, char **argv)
 			frames = ngp_script_frames(script);
 		ngp_script_apply(script, 0, &g_controls, script_poke, nullptr);
 	}
+	ngp_board.controls = g_controls;               // held at power on: no NMI for them
 
 	// The TMP95C061 (MAME's ngp_common): an 8-bit bus, port A to the Z80's IRQ, the main battery full
 	reference_cpu cpu(g_config);
@@ -948,7 +786,7 @@ int main(int argc, char **argv)
 	cpu.space(AS_PROGRAM).w16 = bus_w16;
 	cpu.space(AS_PROGRAM).w32 = bus_w32;
 	cpu.space(AS_PROGRAM).width = 8;
-	cpu.porta_write().set([](offs_t, uint8_t data) { port_a(data); });
+	cpu.porta_write().set([](offs_t, uint8_t data) { ngp_port_a(data); });
 	cpu.an_read<0>().set([] { return uint16_t(0x3ff); });
 	cpu.instruction_hook = on_instruction;
 	cpu.log_handler = [](const std::string &message) { std::cerr << message; };
@@ -957,16 +795,29 @@ int main(int argc, char **argv)
 		for (offs_t address = entry.start; address <= entry.end && address < 0x80; address++)
 			g_internal[address] = &entry;
 
-	static const ns_host sound_host = { comm_read, comm_write, int5 };
-	ns_attach(0, g_sound_ram, &sound_host);
+	// What the board asks of the chips
+	ngp_board.hooks.internal_read = internal_read;
+	ngp_board.hooks.internal_write = internal_write;
+	ngp_board.hooks.k2ge_read = nv_read;
+	ngp_board.hooks.k2ge_write = nv_write;
+	ngp_board.hooks.psg_write = psg_write;
+	ngp_board.hooks.psg_enable = psg_enable;
+	ngp_board.hooks.dac_write = dac_write;
+	ngp_board.hooks.z80_run = z80_run;
+	ngp_board.hooks.z80_nmi = z80_nmi;
+	ngp_board.hooks.z80_irq = z80_irq;
+	ngp_board.hooks.nmi = power_nmi;
+	ngp_board.hooks.data_read = record_rom_read;
+
+	static const ns_host sound_host = { ngp_comm_read, ngp_comm_write, int5 };
+	ns_attach(0, ngp_board.sound_ram, &sound_host);
 	nv_attach(now, vblank_pin, hblank_pin);
 
-	// MAME's machine_reset: the CPU from its reset vector, or the BIOS's restart when the NVRAM was loaded
+	// MAME's machine_reset (TO3 low: ngp_power_on): the CPU from its reset vector, or the BIOS's restart when the
+	// NVRAM was loaded
 	cpu.reset();
-	g_old_to3 = 0;
 	if (nvram_loaded)
 		cpu.set_pc(0xff1800);
-	bool power = (g_controls & NGP_POWER) != 0;
 
 	if (!log_path.empty())
 	{
@@ -986,12 +837,7 @@ int main(int argc, char **argv)
 	// VBLANK: the frame ends
 	auto end_frame = [&](uint64_t frame, uint64_t time) {
 		ngp_script_apply(script, frame, &g_controls, script_poke, nullptr);
-		const bool pressed = (g_controls & NGP_POWER) != 0;
-		if (pressed != power)
-		{
-			power = pressed;
-			power_changed(pressed);
-		}
+		ngp_set_controls(g_controls);
 		ns_end_frame(time);
 		compare_runtime_picture(frame);
 		if (sound_hashes.is_open())
@@ -1058,7 +904,8 @@ int main(int argc, char **argv)
 		<< "instructions:      " << g_instructions << '\n'
 		<< "unique addresses:  " << unique << '\n'
 		<< "final PC:          " << std::hex << cpu.pc() << std::dec << '\n'
-		<< "flash writes:      " << g_flash_writes << '\n'
+		<< "flash writes:      " << ngp_board.flash_writes << '\n'
+		<< "flash outside the save area: " << ngp_board.flash_lost << '\n'
 		<< "Z80 cycles:        " << ns_z80_cycles() << '\n'
 		<< "runtime K2GE lines unlike MAME's: " << g_runtime_lines_unlike;
 	if (g_runtime_lines_unlike)
